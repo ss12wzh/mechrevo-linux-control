@@ -7,9 +7,11 @@ PKG="mrv-ctl_${VER}_all"
 ROOT="$(mktemp -d)/${PKG}"
 
 mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/bin" "$ROOT/opt/mrv" "$ROOT/lib/systemd/system" \
-         "$ROOT/usr/share/icons/hicolor/256x256/apps"
+         "$ROOT/usr/share/icons/hicolor/256x256/apps" "$ROOT/usr/share/mrv-ctl"
 
 install -m 755 mrvd.py      "$ROOT/opt/mrv/mrvd.py"
+install -m 644 mrvmodel.py  "$ROOT/opt/mrv/mrvmodel.py"
+install -m 644 data/models.json "$ROOT/usr/share/mrv-ctl/models.json"
 install -m 755 mrvctl       "$ROOT/usr/bin/mrvctl"
 install -m 755 mrv-gui      "$ROOT/usr/bin/mrv-gui"
 install -m 644 mrvd.service "$ROOT/lib/systemd/system/mrvd.service"

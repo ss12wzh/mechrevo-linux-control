@@ -12,8 +12,10 @@ mrv-gui — 机械革命 Linux 控制台图形界面
 import json
 import os
 import socket
+import sys
 import threading
 import time
+import traceback
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -27,7 +29,13 @@ except (ValueError, ImportError):
     HAS_INDICATOR = False
 
 SOCK_PATH = "/run/mrvd/mrvd.sock"
-VERSION = "3.3.2"
+DEBUG = os.environ.get("MRV_GUI_DEBUG") == "1"
+
+
+def dbg(msg):
+    if DEBUG:
+        print(f"[gui {time.strftime('%T')}] {msg}", file=sys.stderr, flush=True)
+VERSION = "3.4.3"
 CONFIG_PATH = os.path.join(GLib.get_user_config_dir(), "mrv-ctl", "gui.json")
 SHADOW_MARGIN = 14              # 透明窗口外沿, 用来画面板阴影
 
@@ -36,6 +44,7 @@ PROFILE_NAMES = dict(PROFILES)
 MUX_MODES = (("igpu", "集显"), ("standard", "标准"), ("dgpu", "直连"))
 FAN_MODES = (("auto", "自动"), ("boost", "强冷"))
 FAN_MODE_NAMES = {"auto": "EC 自动", "boost": "强冷", "auto-boost": "高温强冷中"}
+PPT_SOURCE = {"calibrated": "本机校准", "model": "内置档案"}
 KBD_EFFECTS = (("solid", "单色"), ("rainbow", "彩虹"), ("off", "关闭"))
 # 键盘灯预设色 (multi_intensity 各通道 0-200)
 SWATCHES = ((200, 200, 200), (185, 40, 46), (200, 110, 30), (120, 200, 160), (40, 120, 200), (130, 70, 200))
@@ -531,6 +540,7 @@ class MrvApp:
         self.feats = {}
         self._suppress = False
         self._refreshing = False
+        self._refresh_t = 0.0
         self._fan_peak = 6000
         self._pending_mux = None
         self._dragging = set()          # 正在拖动的滑条, 刷新时不回写
@@ -824,6 +834,7 @@ class MrvApp:
         self.gear_menu = self._menu(gear, [
             ("keep_above", "窗口置顶", lambda *_: self.set_keep_above(not self.cfg.get("keep_above", False))),
             ("bubble", "悬浮窗", lambda *_: self.set_bubble(not self.bubble.get_visible())),
+            ("calibrate", "校准功耗墙", lambda *_: self._send({"op": "calibrate"})),
             None,
             ("quit", "退出 mrv-ctl", self.on_quit),
         ])
@@ -953,11 +964,23 @@ class MrvApp:
 
     # ---------------------------------------------------- 数据刷新
     def refresh(self):
-        if not self._refreshing:
-            self._refreshing = True
-            threading.Thread(target=lambda: GLib.idle_add(self._apply, call({"op": "status"})),
-                             daemon=True).start()
+        # 标志超过 15 秒未复位 (工作线程意外退出) 就强制重来, 保证 GUI 永远能恢复刷新
+        if self._refreshing and time.monotonic() - self._refresh_t < 15:
+            dbg("refresh: 上一次仍在进行, 跳过")
+            return True
+        dbg("refresh: 调度")
+        self._refreshing = True
+        self._refresh_t = time.monotonic()
+        threading.Thread(target=self._refresh_worker, daemon=True).start()
         return True
+
+    def _refresh_worker(self):
+        try:
+            st = call({"op": "status"})
+        except BaseException as e:
+            st = {"ok": False, "error": repr(e)}
+        dbg(f"worker: 请求完成 ({'ok' if 'profile' in st else st.get('error')})")
+        GLib.idle_add(self._apply, st)
 
     def _query_mux(self):
         r = call({"op": "mux", "value": "query"})
@@ -988,6 +1011,10 @@ class MrvApp:
             self._apply_title(st)
             self._apply_overview(st)
             self._apply_controls(st)
+            dbg("apply: 完成")
+        except Exception:
+            dbg("apply: 异常\n" + traceback.format_exc())
+            raise
         finally:
             self._suppress = False
         if self.bubble.get_visible():
@@ -997,8 +1024,9 @@ class MrvApp:
     def _apply_title(self, st):
         prof = st.get("profile")
         caps = self.feats.get("cpu_ppt_table") or {}
+        src = PPT_SOURCE.get(self.feats.get("cpu_ppt_source"), "")
         for key, b in self.profile_tabs.buttons.items():
-            b.set_tooltip_text(f"CPU 功耗墙约 {caps[key]} W (本机实测)" if key in caps else None)
+            b.set_tooltip_text(f"CPU 功耗墙约 {caps[key]} W ({src})" if key in caps else None)
         if prof in PROFILE_NAMES:
             self.profile_tabs.select(prof)
         else:
@@ -1022,18 +1050,22 @@ class MrvApp:
         # CPU
         c = st.get("cpu", {})
         ct = st.get("cpu_temp")
-        self.sec_cpu.plan.set_text(f.get("cpu_model", ""))
+        cal = st.get("calibration") or {}
+        self.sec_cpu.plan.set_text(f"校准中 {cal.get('step', '')}" if cal.get("running") else f.get("cpu_model", ""))
         avg, peak, pw = c.get("freq_avg_mhz"), c.get("freq_max_mhz"), c.get("power_w")
         max_mhz = f.get("cpu_max_mhz") or 5500
         plat = st.get("platform") or {}
         cap = plat.get("cpu_ppt_w")
+        boost = st.get("cpu_boost")
         self.sec_cpu.meta.set_text(" · ".join(x for x in (
             f"{ct:.0f}°C" if ct is not None else "",
-            f"功耗墙 ≈{cap} W" if cap else "", f"最高 {max_mhz} MHz") if x))
+            f"功耗墙 ≈{cap} W" if cap else "",
+            "睿频已关" if boost is False else f"最高 {max_mhz} MHz") if x))
         self.m_cpu["temp"].update(f"{ct:.0f}°C" if ct is not None else "—", (ct or 0) / 100, self._temp_level(ct))
         self.m_cpu["power"].update(f"{pw:.1f} W" if pw is not None else "—", (pw or 0) / (cap or 120),
                                    "warn" if cap and pw and pw >= cap * 0.95 else None,
-                                   f"{prof}档功耗墙 ≈{cap} W (实测)" if cap else None)
+                                   f"{prof}档功耗墙 ≈{cap} W ({PPT_SOURCE.get(plat.get('cpu_ppt_source'), '')})"
+                                   if cap else None)
         self.m_cpu["freq"].update(f"{avg} MHz" if avg else "—", (avg or 0) / max_mhz)
         self.m_cpu["peak"].update(f"{peak} MHz" if peak else "—", (peak or 0) / max_mhz)
 

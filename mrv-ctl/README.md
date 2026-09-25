@@ -2,7 +2,7 @@
 
 **v3 新增（三期）**：
 - **GUI 图形界面**（`mrv-gui`，GTK3 深色主题，对标 L-Mechrevo）：性能模式三键、显卡模式三选（集显/标准/直连，重启生效）、电池限充滑条（含循环次数）、键盘灯（单色/流畅彩虹/颜色选择器）、更多开关（FnLock/超级键/睡眠呼吸/离电自动关灯）、托盘常驻、可拖动悬浮窗（温度/功耗/转速）
-- **deb 包一键安装**（`mrv-ctl_3.0.0_all.deb`）：`sudo dpkg -i mrv-ctl_*.deb` 后自动完成模块加载、开机自载配置、守护进程启用、nvidia-powerd 修复（unit + D-Bus policy）、桌面入口与自启动——新机安装即用
+- **deb 包一键安装**：`sudo ./install.sh` 后自动完成模块加载、开机自载、守护进程、nvidia-powerd 修复、桌面入口。能力按机型探测，**不能保证所有 40/50 系开箱即用**（详见 [`说明书.md`](说明书.md)）
 - **40/50 系多机型兼容层**：mrvd 启动时自动探测机型能力（性能模式/限充/风扇/RGB/彩虹/呼吸/FnLock/超级键/Mux），UI 按能力自适应渲染，不支持的区块自动隐藏
 - **动态灯效**：流畅彩虹（固件动画）、单色（颜色选择器取色）、离电自动关灯（插电恢复）
 
@@ -13,6 +13,8 @@
 
 Ubuntu 24.04 下对标 Windows 版控制台（L-Mechrevo / NvpwrControl）的开源控制台。
 在机械革命苍龙系列（Ryzen 9 8945HX + RTX 5060 Laptop，Uniwill 准系统）上开发与验证。
+
+**给最终用户**：安装范围、实测功耗、Windows 140W 原因与 Linux 实现路径见 [`说明书.md`](说明书.md)。
 
 ## 功能与验证状态
 
@@ -83,6 +85,15 @@ mrvctl (CLI, 免 root)
 - ~~Mux 切换~~ ✅ 命令实现（切换需重启，实测风险自担）
 - 超上限 TGP：遗留研究（需 EC/NVPCF 联合调参，暂无安全路径）
 - acpi_call 替换为自研内核模块：待做（当前通道稳定，优先级降低）
+
+## v3.4 变更（2026-09-25，多机型适配）
+
+- 新增 `mrvmodel.py` + `data/models.json`：机型识别、档案匹配、DSDT/EC 能力门槛；硬编码的功耗墙表移入档案
+- 新增 `mrvctl calibrate`（GUI：设置 → 校准功耗墙）：本机实测各档 CPU 功耗墙，按主板 + BIOS + CPU 存盘；本机结果 46 / 87 / 132 W
+- 新增 `mrvctl info`：显示识别结果、档案、DSDT 方法与功能门槛
+- 静音档联动关闭 CPU 睿频；GUI 显示"睿频已关"；最高频率改读 `amd_pstate_max_freq`（不受睿频开关影响）
+- 开机恢复档位不再覆盖用户手动调过的键盘灯亮度（只有主动切档才联动灯效）
+- GUI：刷新标志 15 秒未复位时强制重置；`MRV_GUI_DEBUG=1` 输出刷新调试日志；`scripts/gui-debug.py` 支持 SIGUSR1 打印线程栈
 
 ## v3.3.1 变更（2026-09-25，性能档复核）
 
@@ -173,6 +184,27 @@ mrvctl (CLI, 免 root)
 - **GPU 侧**：EC 切档后自行触发 SCI（`_Q83/_Q84/_Q9C`）把 TPP / 动态加速 / cTGP 基础值通知 NVIDIA 驱动；升档、降档都能跟随（`docs/perf/3-downward.jsonl`）。静音档 GPU 上限（105W）反而高于平衡档（85W），是 Dynamic Boost 在同一平台预算内把 CPU 省下的功耗分给了 GPU。
 - **MMIO 与 WKBC 写 0x0751 效果相同**（A/B 对照 A1/A2），EC 对模式位的直接改写会感知（与风扇表不同）。
 - `nvidia-smi -pl` 仍被驱动拒绝；超过 OEM 115W 上限仍无安全通道。
+
+### 静音档空闲为什么贴着功耗墙
+
+"空闲"并不空：ToDesk 远程桌面持续占用约 130% CPU 做屏幕采集与编码，加上 Cursor / Xorg，32 线程里始终有约 5 个在忙。
+这类轻线程负载会被 SMU 推到最高睿频，再叠加 8945HX（桌面级 Dragon Range）IO die 本身二三十瓦的基础功耗，就顶到了静音档的墙。
+温度证实这是真实功耗而不是读数问题：平衡档同样的"空闲"下 Tctl 85°C，静音档 64°C（RAPL "core" 域只统计单个核心，不能用来判断）。
+
+3.4 起静音档联动关闭 CPU 睿频（`/sys/devices/system/cpu/cpufreq/boost`），同样后台负载下空闲功耗 46 → 38–40 W；
+进一步降低需要减少后台负载，例如把 ToDesk 改为硬件编码。
+
+## 多机型适配（3.4，思路参考 NvpwrControl）
+
+| NvpwrControl 的做法 | mrv-ctl 对应实现（`mrvmodel.py`） |
+|---|---|
+| 识别 GPU 名称 → 选型号档案，每个档案一套功耗菜单 | DMI 厂商 / 主板 / BIOS + EC 平台代际（GFID, 0x07D2）+ CPU 型号 + GPU PCI ID → 匹配 `data/models.json` |
+| 高风险后端要求设备 ID、驱动版本、结构校验全部通过 | 功能门槛（`gates`）：按 DSDT 是否提供 `ECRR/ECRW/WKBC/PMSF/PLIM/DGPS/IGPS` 与 EC 可读性决定开放，并给出关闭原因 |
+| 可调范围从驱动实时回读，驱动不报就显示 N/A | EC 平台参数（TPP / 动态加速 / cTGP）实时读取；sysfs 能力按存在性探测 |
+| 动态 OEM 基线：运行时捕获基线，不写死 | `mrvctl calibrate` 本机实测各档 CPU 功耗墙，按"主板 + BIOS + CPU"存 `/var/lib/mrvd/calibration.json`，BIOS 升级自动失效 |
+| 没有证据的值不外推（275 W 锁定） | 未收录机型不套用任何功耗数值；优先级：本机校准 > 内置档案 > 无 |
+
+`mrvctl info` 查看识别结果、匹配档案、DSDT 方法与各功能门槛。新机型接入流程：安装 → `mrvctl info` 确认门槛 → `mrvctl calibrate` → 把结果和 `info` 输出提交到 `data/models.json`。
 
 ## 风扇控制（2026-09-25 实测结论）
 

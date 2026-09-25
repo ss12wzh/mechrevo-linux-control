@@ -26,6 +26,8 @@ import sys
 import threading
 import time
 
+import mrvmodel
+
 RUN_DIR = "/run/mrvd"
 SOCK_PATH = f"{RUN_DIR}/mrvd.sock"
 ACPI_LOCK_FILE = f"{RUN_DIR}/acpi_call.lock"
@@ -54,12 +56,8 @@ PWM_MAX = 200               # multi_intensity 各通道上限
 EC_REG_CTWA = 0x0788        # GPU cTGP 基础功耗 -> NPCF.ACBT
 EC_REG_DBAP = 0x07D5        # Dynamic Boost -> NPCF.AMAT
 EC_REG_ETPP = 0x07F7        # 平台总处理功耗 TPP -> NPCF.ATPP
-
-# 各档 CPU 封装功耗墙实测值 (W). EC 非自定义模式下 APL1/APL2 (0x0783/0x0784) 为 0, 功耗墙由固件内部决定,
-# 无寄存器可读, 只能按机型记录实测结果 (docs/perf/*.jsonl, openssl 32 进程满载稳态)
-MEASURED_CPU_PPT = {
-    "CANGLONG Series-M6DR55": {"office": 45, "balanced": 87, "boost": 130},
-}
+# CPU 功耗墙: EC 非自定义模式下 APL1/APL2 (0x0783/0x0784) 为 0, 由固件内部决定, 无寄存器可读;
+# 数值来自本机校准 (mrvctl calibrate) 或已验证机型档案 (data/models.json), 见 mrvmodel
 
 LED_DIR = "/sys/class/leds/uniwill:multicolor:status"
 INOU_DIR = "/sys/devices/platform/INOU0000:00"
@@ -99,16 +97,7 @@ def ec_read(addr: int):
     return None
 
 
-def has_wkbc() -> bool:
-    """DSDT 是否提供 \\_SB.AMW0.WKBC (OEM WMI 写 EC 的命令通道)"""
-    try:
-        with open("/sys/firmware/acpi/tables/DSDT", "rb") as f:
-            return b"WKBC" in f.read()
-    except OSError:
-        return False
-
-
-EC_VIA_WKBC = False
+EC_VIA_WKBC = False         # DSDT 提供 \_SB.AMW0.WKBC (OEM WMI 写 EC 的命令通道) 时启用
 
 
 def ec_write(addr: int, value: int) -> bool:
@@ -212,13 +201,23 @@ def get_profile():
         bits, f"custom(0x{v:02X})")
 
 
-# 档位联动: 功耗墙由 EC 固件随档位位切换; 这里只附带 CPU EPP 与灯效.
-# EPP 不影响满载功耗 (A/B 实测), 只影响轻负载时的频率策略与能耗
+# 档位联动: 功耗墙由 EC 固件随档位位切换; 这里附带 CPU EPP / 睿频与灯效.
+# EPP 不影响满载功耗 (A/B 实测); 静音档关睿频让轻负载下空闲功耗 46 -> 39.5 W (后台 ToDesk 编码时实测)
 PROFILE_ACTIONS = {
-    "office": {"epp": "power", "kbd_brightness": 30, "kbd_rainbow": False},
-    "balanced": {"epp": "balance_performance", "kbd_brightness": 80, "kbd_rainbow": False},
-    "boost": {"epp": "performance", "kbd_brightness": 150, "kbd_rainbow": True},
+    "office": {"epp": "power", "cpu_boost": False, "kbd_brightness": 30, "kbd_rainbow": False},
+    "balanced": {"epp": "balance_performance", "cpu_boost": True, "kbd_brightness": 80, "kbd_rainbow": False},
+    "boost": {"epp": "performance", "cpu_boost": True, "kbd_brightness": 150, "kbd_rainbow": True},
 }
+CPU_BOOST_PATH = "/sys/devices/system/cpu/cpufreq/boost"
+
+
+def apply_cpu_boost(on: bool) -> bool:
+    try:
+        with open(CPU_BOOST_PATH, "w") as f:
+            f.write("1" if on else "0")
+        return True
+    except OSError:
+        return False
 
 
 def apply_epp(value: str) -> bool:
@@ -239,16 +238,19 @@ def apply_epp(value: str) -> bool:
     return ok
 
 
-def apply_profile_actions(name: str):
-    """应用档位联动 (CPU/灯效)"""
+def apply_profile_actions(name: str, kbd=True):
+    """应用档位联动 (CPU/灯效); kbd=False 时不动键盘灯, 保留用户手动调过的亮度"""
     act = PROFILE_ACTIONS.get(name)
     if not act:
         return
     if act.get("epp"):
         apply_epp(act["epp"])
-    kbd_set(brightness=act.get("kbd_brightness", 0),
-            effect=("rainbow" if act.get("kbd_rainbow") else "solid"))
-    log(f"档位联动已应用: {name} (EPP={act.get('epp')})")
+    if "cpu_boost" in act:
+        apply_cpu_boost(act["cpu_boost"])
+    if kbd:
+        kbd_set(brightness=act.get("kbd_brightness", 0),
+                effect=("rainbow" if act.get("kbd_rainbow") else "solid"))
+    log(f"档位联动已应用: {name} (EPP={act.get('epp')}, 睿频={'开' if act.get('cpu_boost', True) else '关'})")
 
 
 # set_profile 与物理键轮询共享"最近一次已联动的档位", 避免同一次切换联动两遍;
@@ -257,7 +259,8 @@ _profile_lock = threading.RLock()
 _profile_seen = None
 
 
-def set_profile(name):
+def set_profile(name, link=True, kbd=True):
+    """link=False: 只切 EC 档位位, 不做任何联动 (校准用); kbd=False: 联动 CPU 但不动键盘灯 (开机恢复用)"""
     global _profile_seen
     if name not in PROFILE_BITS:
         return {"ok": False, "error": f"未知档位 {name}"}
@@ -271,7 +274,8 @@ def set_profile(name):
         if ok:
             _profile_seen = name
             state_update(profile=name)
-            apply_profile_actions(name)
+            if link:
+                apply_profile_actions(name, kbd=kbd)
     log(f"性能模式 -> {name}: {'OK' if ok else 'FAIL'}")
     return {"ok": ok, "profile": name if ok else None}
 
@@ -476,18 +480,6 @@ def toggle_sysfs(name: str, enable: bool) -> dict:
 
 
 # ================================================================ 机型能力探测
-def cpu_model() -> str:
-    try:
-        with open("/proc/cpuinfo") as f:
-            for line in f:
-                if line.startswith("model name"):
-                    name = line.split(":", 1)[1].strip()
-                    return name.split(" w/ ")[0].replace(" with Radeon Graphics", "")
-    except OSError:
-        pass
-    return ""
-
-
 def gpu_name() -> str:
     try:
         out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
@@ -498,9 +490,13 @@ def gpu_name() -> str:
         return ""
 
 
-def probe_features() -> dict:
-    """40/50 系多机型兼容: 探测本机支持的硬件能力, UI 按此自适应"""
+def probe_features(dsdt: dict) -> dict:
+    """多机型适配: 识别 -> 档案 -> 门槛 -> 校准 (mrvmodel); sysfs 能力按存在性探测, UI 按此自适应"""
     inou = INOU_DIR
+    ident = mrvmodel.identity(ec_read)
+    model = mrvmodel.match_model(ident, mrvmodel.load_models())
+    ppt_source, ppt = mrvmodel.cpu_ppt(ident, model)
+    gates = mrvmodel.gates(ident, dsdt, ec_read(EC_REG_PROFILE) is not None)
     dmi = "/sys/class/dmi/id"
     def dmi_read(n):
         try:
@@ -512,8 +508,12 @@ def probe_features() -> dict:
         "product": dmi_read("product_name") or "Uniwill Platform",
         "vendor": dmi_read("sys_vendor"),
         "barebone_id": ec_read(0x0740),
-        "profile": ec_read(EC_REG_PROFILE) is not None,
-        "charge": ec_read(EC_REG_CHARGE) is not None,
+        "identity": ident,
+        "model": {"id": model["id"], "name": model["name"]} if model else None,
+        "dsdt": dsdt,
+        "gates": gates,
+        "profile": gates["profile"]["ok"],
+        "charge": gates["charge"]["ok"],
         "fan": bool(HW),
         "rgb": os.path.exists(f"{LED_DIR}/multi_intensity"),
         "rainbow": os.path.exists(f"{inou}/rainbow_animation"),
@@ -521,16 +521,18 @@ def probe_features() -> dict:
         "fn_lock": os.path.exists(f"{inou}/fn_lock"),
         "super_key": os.path.exists(f"{inou}/super_key_enable"),
         "logo_light": False,       # lightbar 寄存器需实测, 默认隐藏
-        "fan_boost": ec_read(EC_REG_PROFILE) is not None,
+        "fan_boost": gates["fan_boost"]["ok"],
         "ec_channel": "wkbc" if EC_VIA_WKBC else "mmio",
-        "cpu_model": cpu_model(),
+        "cpu_model": ident["cpu"],
         "gpu_name": gpu_name(),
-        "cpu_max_mhz": (v := read_text("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq"))
-                       and int(v) // 1000,
-        "cpu_ppt_table": cpu_ppt_table(),
+        # cpuinfo_max_freq 在关睿频后变成基础频率; amd_pstate_max_freq 始终是最高睿频
+        "cpu_max_mhz": (v := read_text("/sys/devices/system/cpu/cpu0/cpufreq/amd_pstate_max_freq")
+                        or read_text("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")) and int(v) // 1000,
+        "cpu_ppt_table": ppt,
+        "cpu_ppt_source": ppt_source,
     }
-    # mux 能力: DGPS 查询成功即支持
-    out = acpi_method(f"{MUX_PATH}.DGPS")
+    # mux: 先过门槛 (DSDT 方法 + 平台代际), 再要求 DGPS 实际返回已知值
+    out = acpi_method(f"{MUX_PATH}.DGPS") if gates["mux"]["ok"] else "Error: gated"
     feats["mux"] = not out.startswith("Error") and out in ("0x0", "0x1", "0x2", "0xaa", "0x55")
     return feats
 
@@ -729,14 +731,85 @@ def charge_limit():
     return (v & 0x7F) or 100
 
 
-def cpu_ppt_table() -> dict:
-    board = read_text("/sys/class/dmi/id/board_name") or ""
-    return next((v for k, v in MEASURED_CPU_PPT.items() if board.startswith(k)), {})
+# 满载负载: 每个逻辑核一个子进程做 sha256; 60 秒后自行退出, 守护进程异常时也不会留下负载
+_LOAD_CODE = ("import hashlib, time\nd = b'x' * 16384\nend = time.time() + 60\n"
+              "while time.time() < end:\n    hashlib.sha256(d).digest()\n")
+
+
+class Calibrator(threading.Thread):
+    """本机实测各档 CPU 功耗墙 (对应 NvpwrControl 的动态 OEM 基线: 基线在运行时取得, 不写死).
+    每档: 切档 -> 等待 -> 满载 -> 取稳态段 RAPL 封装功耗 -> 冷却; 结束后恢复原档位, 结果按机型+BIOS 存盘"""
+    SETTLE_S, RAMP_S, MEASURE_S, COOL_S = 5, 8, 12, 15
+    TEMP_ABORT = 99.0
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.state = {"running": True, "step": "准备", "result": None, "error": None}
+
+    def _energy(self):
+        with open(RAPL_PATH) as f:
+            return int(f.read().strip()), time.time()
+
+    def run(self):
+        orig = get_profile()
+        procs, result = [], {}
+        try:
+            apply_cpu_boost(True)       # 静音档联动会关睿频, 测功耗墙时必须打开, 否则高档测不到上限
+            for i, prof in enumerate(PROFILE_BITS):
+                self.state["step"] = f"{prof} {i + 1}/{len(PROFILE_BITS)}"
+                if not set_profile(prof, link=False).get("ok"):
+                    raise RuntimeError(f"切换到 {prof} 失败")
+                time.sleep(self.SETTLE_S)
+                procs = [subprocess.Popen([sys.executable, "-c", _LOAD_CODE]) for _ in range(os.cpu_count() or 1)]
+                time.sleep(self.RAMP_S)
+                e0, t0 = self._energy()
+                for _ in range(self.MEASURE_S):
+                    time.sleep(1)
+                    temp = guard.current_temp()
+                    if temp is not None and temp >= self.TEMP_ABORT:
+                        raise RuntimeError(f"温度 {temp:.0f}°C 过高, 中止校准")
+                e1, t1 = self._energy()
+                result[prof] = round((e1 - e0) / (t1 - t0) / 1e6)
+                for p in procs:
+                    p.kill()
+                procs = []
+                log(f"校准 {prof}: CPU 功耗墙 ≈{result[prof]} W")
+                time.sleep(self.COOL_S)
+            ident = FEATURES_CACHE["identity"]
+            mrvmodel.save_calibration(ident, result)
+            FEATURES_CACHE.update(cpu_ppt_table=result, cpu_ppt_source="calibrated")
+            self.state["result"] = result
+        except Exception as e:
+            self.state["error"] = str(e)
+            log(f"校准失败: {e}")
+        finally:
+            for p in procs:
+                p.kill()
+            if orig in PROFILE_BITS:
+                set_profile(orig, link=False)
+                apply_cpu_boost(PROFILE_ACTIONS[orig].get("cpu_boost", True))
+            self.state.update(running=False, step="完成" if not self.state["error"] else "失败")
+
+
+calibrator = None
+
+
+def start_calibration() -> dict:
+    global calibrator
+    gate = FEATURES_CACHE.get("gates", {}).get("calibrate", {})
+    if not gate.get("ok"):
+        return {"ok": False, "error": gate.get("why") or "不支持校准"}
+    if calibrator and calibrator.state["running"]:
+        return {"ok": False, "error": "校准正在进行"}
+    calibrator = Calibrator()
+    calibrator.start()
+    return {"ok": True, "calibration": calibrator.state}
 
 
 def platform_info(profile: str) -> dict:
     return {"tpp_w": ec_read(EC_REG_ETPP), "db_w": ec_read(EC_REG_DBAP), "ctgp_base_w": ec_read(EC_REG_CTWA),
-            "cpu_ppt_w": FEATURES_CACHE.get("cpu_ppt_table", {}).get(profile)}
+            "cpu_ppt_w": FEATURES_CACHE.get("cpu_ppt_table", {}).get(profile),
+            "cpu_ppt_source": FEATURES_CACHE.get("cpu_ppt_source")}
 
 
 def status():
@@ -744,6 +817,7 @@ def status():
     st = {
         "profile": profile,
         "platform": platform_info(profile),
+        "cpu_boost": read_text(CPU_BOOST_PATH) == "1" if os.path.exists(CPU_BOOST_PATH) else None,
         "gpu": gpu_info(),
         "cpu": cpu_info(),
         "fan1_rpm": (v := hw_read("fan1_input")) and int(v),
@@ -763,6 +837,7 @@ def status():
                     if os.path.exists(f"{INOU_DIR}/{n}")},
         "battery": battery_info(),
         "ac_led_off": ac_led_guard.enabled if ac_led_guard else False,
+        "calibration": calibrator.state if calibrator else None,
         "features": FEATURES_CACHE,
     }
     return st
@@ -817,6 +892,8 @@ def handle_cmd(cmd):
         return {"ok": False, "error": "mux 子命令: query|dgpu|standard"}
     if op == "toggle":
         return toggle_sysfs(cmd.get("name", ""), bool(cmd.get("value")))
+    if op == "calibrate":
+        return start_calibration()
     if op == "ac_led_off":
         enable = bool(cmd.get("value"))
         state_update(ac_led_off=enable)
@@ -922,7 +999,7 @@ def restore_on_boot():
     time.sleep(3)
     prof = st.get("profile")
     if prof in PROFILE_BITS:
-        r = set_profile(prof)
+        r = set_profile(prof, kbd=False)
         log(f"开机恢复性能模式 {prof}: {r.get('ok')}")
     if st.get("fan_curve"):
         state_update(fan_curve=None)     # 旧版用户态曲线的残留状态
@@ -938,7 +1015,8 @@ def main():
         log("WARN 未找到 uniwill hwmon")
     else:
         log(f"hwmon: {HW}")
-    EC_VIA_WKBC = has_wkbc()
+    dsdt = mrvmodel.dsdt_methods()
+    EC_VIA_WKBC = bool(dsdt.get("WKBC"))
     log(f"EC 写入通道: {'WKBC 命令通道' if EC_VIA_WKBC else 'MMIO 直写 (DSDT 无 WKBC)'}")
 
     guard = ThermalGuard()
@@ -952,7 +1030,10 @@ def main():
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, on_term)
 
-    FEATURES_CACHE.update(probe_features())
+    FEATURES_CACHE.update(probe_features(dsdt))
+    m = FEATURES_CACHE.get("model")
+    log(f"机型: {m['name'] if m else '未收录 (仅开放探测到的能力, 不套用任何功耗数值)'}; "
+        f"CPU 功耗墙来源: {FEATURES_CACHE.get('cpu_ppt_source') or '无'}")
     log(f"机型能力: {json.dumps(FEATURES_CACHE, ensure_ascii=False)}")
 
     guard.start()

@@ -15,6 +15,8 @@ mrvctl — 机械革命 Linux 控制台 CLI
   mrvctl charge <20-100>               电池限充
   mrvctl mux query                     独显直连状态查询
   mrvctl mux dgpu|standard --yes       Mux 切换 (需重启生效, 谨慎)
+  mrvctl info                          机型识别 / 档案 / 能力门槛
+  mrvctl calibrate                     本机实测各档 CPU 功耗墙 (约 2 分钟, 会满载 CPU)
 
 写操作需要 root 或 sudo/mrv 组成员。
 """
@@ -22,6 +24,9 @@ mrvctl — 机械革命 Linux 控制台 CLI
 import json
 import socket
 import sys
+import time
+
+PPT_SOURCE = {"calibrated": "本机校准", "model": "内置档案"}
 
 SOCK_PATH = "/run/mrvd/mrvd.sock"
 
@@ -52,7 +57,8 @@ def fmt(v, spec="", unit="", none="--"):
 def cmd_status(r):
     print(f"性能模式   : {r.get('profile')}")
     p = r.get("platform") or {}
-    cap = f"CPU 功耗墙 ≈{p['cpu_ppt_w']} W (实测) · " if p.get("cpu_ppt_w") else ""
+    src = PPT_SOURCE.get(p.get("cpu_ppt_source"), "")
+    cap = f"CPU 功耗墙 ≈{p['cpu_ppt_w']} W ({src}) · " if p.get("cpu_ppt_w") else ""
     print(f"平台参数   : {cap}TPP {fmt(p.get('tpp_w'), '', ' W')} · 动态加速 {fmt(p.get('db_w'), '', ' W')}"
           f" · GPU 基础 {fmt(p.get('ctgp_base_w'), '', ' W')}")
     g = r.get("gpu", {})
@@ -75,6 +81,41 @@ def cmd_status(r):
     print(f"键盘灯     : {effect} RGB({r.get('kbd_rgb')}) 亮度 {r.get('kbd_brightness')}")
 
 
+def cmd_info(r):
+    f = r.get("features") or {}
+    i = f.get("identity") or {}
+    m = f.get("model")
+    print(f"机型识别   : {i.get('vendor')} / {i.get('product')} / 主板 {i.get('board')}")
+    print(f"             BIOS {i.get('bios')} · EC 平台代际 {i.get('gfid')} · {i.get('cpu')} · GPU PCI {i.get('gpu_pci')}")
+    print(f"机型档案   : {m['name'] + ' (' + m['id'] + ')' if m else '未收录 (只开放探测到的能力, 不套用任何功耗数值)'}")
+    table = f.get("cpu_ppt_table") or {}
+    src = PPT_SOURCE.get(f.get("cpu_ppt_source"), "无")
+    print(f"CPU 功耗墙 : {src}  " + "  ".join(f"{k}={v}W" for k, v in table.items()))
+    print("DSDT 方法  : " + "  ".join(f"{k}{'✓' if v else '✗'}" for k, v in (f.get("dsdt") or {}).items()))
+    print("能力门槛   :")
+    for name, g in (f.get("gates") or {}).items():
+        print(f"  {name:10s} {'开放' if g.get('ok') else '关闭: ' + g.get('why', '')}")
+
+
+def cmd_calibrate():
+    r = call({"op": "calibrate"})
+    if not r.get("ok"):
+        sys.exit(f"失败: {r.get('error')}")
+    print("开始校准: 依次切换三档并满载 CPU, 约 2 分钟 ...")
+    last = None
+    while True:
+        time.sleep(3)
+        c = call({"op": "status"}).get("calibration") or {}
+        if c.get("step") != last:
+            print(f"  {c.get('step')}")
+            last = c.get("step")
+        if not c.get("running"):
+            break
+    if c.get("error"):
+        sys.exit(f"校准失败: {c['error']}")
+    print("结果: " + "  ".join(f"{k}={v}W" for k, v in (c.get("result") or {}).items()))
+
+
 def done(r, ok_msg):
     print(ok_msg if r.get("ok") else f"失败: {r.get('error') or r.get('raw')}")
     sys.exit(0 if r.get("ok") else 1)
@@ -89,6 +130,10 @@ def main():
 
     if op == "status":
         cmd_status(call({"op": "status"}))
+    elif op == "info":
+        cmd_info(call({"op": "status"}))
+    elif op == "calibrate":
+        cmd_calibrate()
     elif op == "profile":
         if not rest:
             sys.exit("用法: mrvctl profile office|balanced|boost")
