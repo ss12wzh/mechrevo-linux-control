@@ -27,13 +27,15 @@ except (ValueError, ImportError):
     HAS_INDICATOR = False
 
 SOCK_PATH = "/run/mrvd/mrvd.sock"
-VERSION = "3.2.0"
+VERSION = "3.3.0"
 CONFIG_PATH = os.path.join(GLib.get_user_config_dir(), "mrv-ctl", "gui.json")
 SHADOW_MARGIN = 14              # 透明窗口外沿, 用来画面板阴影
 
 PROFILES = (("office", "静音"), ("balanced", "平衡"), ("boost", "狂暴"))
 PROFILE_NAMES = dict(PROFILES)
 MUX_MODES = (("igpu", "集显"), ("standard", "标准"), ("dgpu", "直连"))
+FAN_MODES = (("auto", "自动"), ("boost", "强冷"))
+FAN_MODE_NAMES = {"auto": "EC 自动", "boost": "强冷", "auto-boost": "高温强冷中"}
 KBD_EFFECTS = (("solid", "单色"), ("rainbow", "彩虹"), ("off", "关闭"))
 # 键盘灯预设色 (multi_intensity 各通道 0-200)
 SWATCHES = ((200, 200, 200), (185, 40, 46), (200, 110, 30), (120, 200, 160), (40, 120, 200), (130, 70, 200))
@@ -666,6 +668,25 @@ class MrvApp:
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         page.set_margin_top(2)
 
+        # 风扇
+        sec = Section("weather-windy-symbolic", "风扇")
+        self.sec_fan_ctl = sec
+        self.fan_tabs = Segmented(FAN_MODES, self.on_fan, wide=True)
+        sec.pack_start(self.fan_tabs, False, False, 0)
+        row = add_class(Gtk.Box(spacing=10), "check-row")
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        text.set_valign(Gtk.Align.CENTER)
+        text.pack_start(label("高温自动强冷", "check-title"), False, False, 0)
+        self.guard_desc = label("", "check-desc")
+        text.pack_start(self.guard_desc, False, False, 0)
+        row.pack_start(text, True, True, 0)
+        self.guard_sw = Gtk.Switch()
+        self.guard_sw.set_valign(Gtk.Align.CENTER)
+        self.guard_sw.connect("notify::active", self.on_guard)
+        row.pack_end(self.guard_sw, False, False, 0)
+        sec.pack_start(row, False, False, 0)
+        page.pack_start(sec, False, False, 0)
+
         # 显卡模式
         sec = Section("video-display-symbolic", "显卡模式")
         sec.plan.set_text("重启生效")
@@ -1027,9 +1048,14 @@ class MrvApp:
 
         # 风扇
         mode = st.get("fan_mode")
-        self.sec_fan.plan.set_text({"unsupported": "EC 固件控制", "curve": "自定义曲线", "auto": "自动"}.get(mode, mode or ""))
-        guard = "超温保护中" if st.get("overheat_guard") else ""
-        self.sec_fan.meta.set_text(guard or ("转速由 EC 固件曲线决定" if mode == "unsupported" else ""))
+        g = st.get("fan_guard") or {}
+        self.sec_fan.plan.set_text(FAN_MODE_NAMES.get(mode, mode or ""))
+        if mode == "auto-boost":
+            self.sec_fan.meta.set_text(f"温度超过 {g.get('on')}°C, 已自动全速")
+        elif mode == "boost":
+            self.sec_fan.meta.set_text("手动强冷, 全速运转")
+        else:
+            self.sec_fan.meta.set_text(f"高温自动强冷 ≥{g.get('on')}°C" if g.get("enabled") else "转速由 EC 固件曲线决定")
         for key in ("fan1", "fan2"):
             rpm = st.get(f"{key}_rpm")
             if rpm:
@@ -1049,6 +1075,15 @@ class MrvApp:
 
     def _apply_controls(self, st):
         f = self.feats
+        mode = st.get("fan_mode")
+        g = st.get("fan_guard") or {}
+        self.fan_tabs.select("boost" if mode == "boost" else "auto")
+        self.sec_fan_ctl.plan.set_text(FAN_MODE_NAMES.get(mode, ""))
+        self.sec_fan_ctl.meta.set_text("本机 EC 仅支持全速模式, 不支持自定义曲线")
+        self.guard_sw.set_active(bool(g.get("enabled")))
+        self.guard_desc.set_text(f"≥{g.get('on')}°C 全速, 回落到 {g.get('off')}°C 交还 EC")
+        for b in self.fan_tabs.buttons.values():
+            b.set_sensitive(bool(f.get("fan_boost")))
         if not f.get("mux"):
             for b in self.mux_tabs.buttons.values():
                 b.set_sensitive(False)
@@ -1106,6 +1141,16 @@ class MrvApp:
         self.profile_tabs.select(key)
         self._send({"op": "profile", "value": key})
         return True
+
+    def on_fan(self, key):
+        if self._suppress:
+            return True
+        self._send({"op": "fan", "value": key})
+        return True
+
+    def on_guard(self, sw, pspec):
+        if not self._suppress:
+            self._send({"op": "fan_guard", "enabled": sw.get_active()})
 
     def on_mux(self, key):
         if self._suppress:

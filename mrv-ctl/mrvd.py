@@ -6,10 +6,11 @@ mrvd — 机械革命苍龙系列 Linux 控制台守护进程
 功能: 性能模式 (EC 0x0751) / 电池限充 (EC 0x07B9) / RGB 键盘灯 / INOU 平台开关 /
       独显直连 Mux (DGPS/IGPS, 需重启生效) / 遥测
 
+风扇: 手动强冷 + 高温自动强冷 (0x0751 bit6 全速模式, 迟滞), 其余时间由 EC 固件曲线控制
+
 安全:
-  - EC 写白名单 + 基线 + 写后读回; /proc/acpi/call 串行化 (线程锁 + flock)
+  - EC 写白名单 + 基线 + 写后读回; 写入走 WKBC 命令通道; /proc/acpi/call 串行化 (线程锁 + flock)
   - IPC 按 SO_PEERCRED 鉴权: 读状态任何人, 写操作需 root 或 sudo/mrv 组
-  - 用户态风扇曲线仅在 hwmon pwm 可写时启用; 否则风扇由 EC 固件控制并如实上报
 """
 
 import fcntl
@@ -19,7 +20,6 @@ import os
 import pwd
 import signal
 import socket
-import stat
 import struct
 import subprocess
 import sys
@@ -34,21 +34,18 @@ STATE_FILE = f"{STATE_DIR}/state.json"
 BASELINE_FILE = f"{STATE_DIR}/baseline.json"
 ACPI_CALL = "/proc/acpi/call"
 
-# EC 寄存器白名单
-EC_REG_PROFILE = 0x0751
+# EC 寄存器白名单 (0x0741 bit0 由内核 uniwill_laptop 管理, 不在此列)
+EC_REG_PROFILE = 0x0751     # 上游驱动称 MANUAL_FAN_CTRL: bit4 TURBO / bit5 HIGH / bit6 BOOST / bit7 USER
 EC_REG_CHARGE = 0x07B9
-EC_REG_AP_OEM = 0x0741
-EC_WHITELIST = {EC_REG_PROFILE, EC_REG_CHARGE, EC_REG_AP_OEM}
+EC_WHITELIST = {EC_REG_PROFILE, EC_REG_CHARGE}
 
 PROFILE_BITS = {"office": 0xA0, "balanced": 0x00, "boost": 0x10}
 PROFILE_CLEAR = 0xB0
+FAN_BOOST_BIT = 0x40        # 全速模式; 本机唯一实测有效的风扇写控制 (docs/probe/fan-experiment-3-direct.log)
 
-TEMP_CRITICAL = 93.0
-TEMP_RECOVER = 85.0
-CURVE_POLL = 2.0            # 曲线引擎采样周期 (秒)
-PWM_MAX = 200
-PWM_DROP_STEP = 12          # 每周期最大降速 (防振荡)
-PWM_MIN_RUN = 25            # 曲线最低运行 PWM (防风扇停转)
+GUARD_POLL = 2.0            # 温度采样周期 (秒)
+GUARD_DEFAULT = {"enabled": True, "on": 88, "off": 78}   # 高温自动强冷: 超过 on 开启, 回落到 off 关闭
+PWM_MAX = 200               # multi_intensity 各通道上限
 
 LED_DIR = "/sys/class/leds/uniwill:multicolor:status"
 INOU_DIR = "/sys/devices/platform/INOU0000:00"
@@ -88,10 +85,27 @@ def ec_read(addr: int):
     return None
 
 
+def has_wkbc() -> bool:
+    """DSDT 是否提供 \\_SB.AMW0.WKBC (OEM WMI 写 EC 的命令通道)"""
+    try:
+        with open("/sys/firmware/acpi/tables/DSDT", "rb") as f:
+            return b"WKBC" in f.read()
+    except OSError:
+        return False
+
+
+EC_VIA_WKBC = False
+
+
 def ec_write(addr: int, value: int) -> bool:
+    """优先走 WKBC 命令通道 (由 EC 固件执行写入, 与 OEM 软件一致);
+    MMIO 直写只改共享 RAM, EC 固件不一定感知 (风扇表实验已证实)"""
     if addr not in EC_WHITELIST:
         log(f"REFUSE 非白名单 EC 地址 0x{addr:04X}")
         return False
+    if EC_VIA_WKBC:
+        out = ec_call(f"\\_SB.AMW0.WKBC 0x{addr & 0xFF:02X} 0x{addr >> 8:02X} 0x{value:02X} 0x00")
+        return not out.startswith("Error")
     out = ec_call(f"\\_SB.INOU.ECRW 0x{addr:04X} 0x{value:02X}")
     return out.startswith("0x")
 
@@ -164,7 +178,6 @@ def find_uniwill_hwmon():
 
 
 HW = ""
-FAN_WRITABLE = False
 
 
 def hw_read(name):
@@ -173,16 +186,6 @@ def hw_read(name):
             return f.read().strip()
     except OSError:
         return None
-
-
-def hw_write(name, value):
-    try:
-        with open(f"{HW}/{name}", "w") as f:
-            f.write(str(value))
-        return True
-    except OSError as e:
-        log(f"WARN hwmon 写 {name}: {e}")
-        return False
 
 
 # ================================================================ 性能模式
@@ -195,28 +198,13 @@ def get_profile():
         bits, f"custom(0x{v:02X})")
 
 
-# 档位联动: 每个档位附带 CPU 性能策略 / 风扇曲线 / 灯效
+# 档位联动: 每个档位附带 CPU 性能策略 / 灯效
 # 说明: Linux 下 GPU 功耗墙由 nvidia-powerd (NVPCF) 固定, EC 档位无法改变它
 #       (Windows 能改是因为其控制台直接改驱动内部对象, Linux 无此通道)
 PROFILE_ACTIONS = {
-    "office": {
-        "epp": "power",                                   # amd-pstate 节能偏好
-        "fan_curve": "45:40,60:70,75:120,88:180",         # 温和
-        "kbd_brightness": 30,
-        "kbd_rainbow": False,
-    },
-    "balanced": {
-        "epp": "balance_performance",
-        "fan_curve": None,                                # 交还 EC 固件曲线
-        "kbd_brightness": 80,
-        "kbd_rainbow": False,
-    },
-    "boost": {
-        "epp": "performance",
-        "fan_curve": "40:60,55:110,70:160,85:200",        # 激进
-        "kbd_brightness": 150,
-        "kbd_rainbow": True,
-    },
+    "office": {"epp": "power", "kbd_brightness": 30, "kbd_rainbow": False},
+    "balanced": {"epp": "balance_performance", "kbd_brightness": 80, "kbd_rainbow": False},
+    "boost": {"epp": "performance", "kbd_brightness": 150, "kbd_rainbow": True},
 }
 
 
@@ -239,29 +227,20 @@ def apply_epp(value: str) -> bool:
 
 
 def apply_profile_actions(name: str):
-    """应用档位联动 (CPU/风扇/灯效)"""
+    """应用档位联动 (CPU/灯效)"""
     act = PROFILE_ACTIONS.get(name)
     if not act:
         return
     if act.get("epp"):
         apply_epp(act["epp"])
-    curve = act.get("fan_curve")
-    if not FAN_WRITABLE:
-        pass
-    elif curve:
-        try:
-            engine.set_curve(parse_curve(curve))
-        except ValueError:
-            pass
-    else:
-        engine.clear_curve()
     kbd_set(brightness=act.get("kbd_brightness", 0),
             effect=("rainbow" if act.get("kbd_rainbow") else "solid"))
     log(f"档位联动已应用: {name} (EPP={act.get('epp')})")
 
 
-# set_profile 与物理键轮询共享"最近一次已联动的档位", 避免同一次切换联动两遍
-_profile_lock = threading.Lock()
+# set_profile 与物理键轮询共享"最近一次已联动的档位", 避免同一次切换联动两遍;
+# 同一把锁也串行化所有对 0x0751 的读改写 (档位位与风扇强冷位同在一个寄存器)
+_profile_lock = threading.RLock()
 _profile_seen = None
 
 
@@ -303,126 +282,112 @@ def profile_watch_loop():
 
 
 # ================================================================ 风扇
-def release_manual():
-    """清 ENABLE_MANUAL_CTRL, 风扇交还 EC 固件曲线"""
-    cur = ec_read(EC_REG_AP_OEM)
-    if cur is None:
-        return False
-    if not cur & 0x01:
-        return True
-    return ec_write_verified(EC_REG_AP_OEM, cur & ~0x01, 0x01)
+# 本机实测 (docs/probe/fan-experiment-*.log): hwmon pwm 只读; EC 自定义风扇表、0x1804/0x1809 直写、
+# FAN_LEVEL 均无效; 唯一有效的写控制是 0x0751 bit6 全速模式, 且须经 WKBC 命令通道写入
+def fan_boost_get():
+    v = ec_read(EC_REG_PROFILE)
+    return None if v is None else bool(v & FAN_BOOST_BIT)
 
 
-def parse_curve(s):
-    """'40:50,55:90,65:130,75:170,85:200' -> [(40,50),(55,90)...]"""
-    pts = []
-    for seg in s.split(","):
-        seg = seg.strip()
-        if not seg:
-            continue
-        t, p = seg.split(":")
-        pts.append((float(t), int(p)))
-    pts.sort(key=lambda x: x[0])
-    if len(pts) < 2:
-        raise ValueError("至少需要 2 个点")
-    temps = [p[0] for p in pts]
-    if any(b <= a for a, b in zip(temps, temps[1:])):
-        raise ValueError("温度点必须严格递增")
-    for t, p in pts:
-        if not (20 <= t <= 100):
-            raise ValueError(f"温度 {t} 超出 20-100")
-        if not (0 <= p <= PWM_MAX):
-            raise ValueError(f"PWM {p} 超出 0-{PWM_MAX}")
-    return pts
+def fan_boost_set(on: bool) -> bool:
+    with _profile_lock:
+        cur = ec_read(EC_REG_PROFILE)
+        if cur is None:
+            return False
+        target = (cur | FAN_BOOST_BIT) if on else (cur & ~FAN_BOOST_BIT & 0xFF)
+        if target == cur:
+            return True
+        return ec_write_verified(EC_REG_PROFILE, target, FAN_BOOST_BIT)
 
 
-def curve_pwm(pts, temp):
-    """线性插值; 超端点钳制"""
-    if temp <= pts[0][0]:
-        return pts[0][1]
-    if temp >= pts[-1][0]:
-        return pts[-1][1]
-    for (t0, p0), (t1, p1) in zip(pts, pts[1:]):
-        if t0 <= temp <= t1:
-            if t1 == t0:
-                return p1
-            return int(p0 + (p1 - p0) * (temp - t0) / (t1 - t0))
-    return pts[-1][1]
-
-
-class FanEngine(threading.Thread):
-    """曲线模式 + 超温兜底, 单线程顺序处理避免互相打架"""
+class ThermalGuard(threading.Thread):
+    """用户强冷 + 高温自动强冷 (迟滞); 任一为真即置全速模式, 否则交还 EC 固件曲线.
+    每个周期都按期望值校正 EC 状态, 休眠唤醒或外部改写后自动恢复."""
 
     def __init__(self):
         super().__init__(daemon=True)
+        st = load_state()
         self.stop_evt = threading.Event()
         self.lock = threading.Lock()
-        self.curve = None        # 曲线点列表, None=EC auto 模式
-        self.last_pwm = None
-        self.overheat = False
-
-    def set_curve(self, pts):
-        if not FAN_WRITABLE:
-            raise ValueError("本机风扇 PWM 只读, 用户态曲线不可用")
-        with self.lock:
-            self.curve = pts
-            self.last_pwm = None
-        state_update(fan_curve=pts and ",".join(f"{t:g}:{p}" for t, p in pts))
-
-    def clear_curve(self):
-        with self.lock:
-            self.curve = None
-            self.last_pwm = None
-            if not self.overheat:
-                release_manual()
-        state_update(fan_curve=None)
+        self.user_boost = bool(st.get("fan_boost"))
+        self.guard = {**GUARD_DEFAULT, **(st.get("fan_guard") or {})}
+        self.auto_active = False
+        self.ec_boost = None
 
     def current_temp(self):
-        vals = []
-        for n in ("temp1_input", "temp2_input"):
-            v = hw_read(n)
-            if v:
-                vals.append(float(v) / 1000)
+        vals = [float(v) / 1000 for n in ("temp1_input", "temp2_input") if (v := hw_read(n))]
         return max(vals) if vals else None
+
+    def wanted(self):
+        return self.user_boost or self.auto_active
+
+    def apply(self):
+        want = self.wanted()
+        cur = fan_boost_get()
+        if cur is not None and cur != want:
+            ok = fan_boost_set(want)
+            log(f"风扇全速模式 -> {'开' if want else '关'}: {'OK' if ok else 'FAIL'}")
+            cur = fan_boost_get()
+        self.ec_boost = cur
 
     def run(self):
         while not self.stop_evt.is_set():
             try:
                 temp = self.current_temp()
-                if temp is None:
-                    self.stop_evt.wait(CURVE_POLL)
-                    continue
                 with self.lock:
-                    if temp >= TEMP_CRITICAL and not self.overheat:
-                        self.overheat = True
-                        if FAN_WRITABLE:
-                            hw_write("pwm1", PWM_MAX)
-                            hw_write("pwm2", PWM_MAX)
-                            log(f"!! 超温兜底 {temp:.0f}°C -> PWM 满")
-                        else:
-                            log(f"!! 超温 {temp:.0f}°C: 风扇不可由软件控制, 由 EC 固件热保护接管")
-                    elif self.overheat and temp < TEMP_RECOVER:
-                        self.overheat = False
-                        log(f"温度回落 {temp:.0f}°C, 恢复常规控制")
-                        if FAN_WRITABLE and self.curve is None:
-                            release_manual()
-                    elif not self.overheat and self.curve is not None:
-                        target = max(curve_pwm(self.curve, temp), PWM_MIN_RUN)
-                        if self.last_pwm is not None and target < self.last_pwm:
-                            target = max(target, self.last_pwm - PWM_DROP_STEP)
-                        hw_write("pwm1", target)
-                        hw_write("pwm2", target)
-                        self.last_pwm = target
+                    g = self.guard
+                    if not g["enabled"] or temp is None:
+                        if self.auto_active:
+                            log("高温自动强冷已停用")
+                        self.auto_active = False
+                    elif not self.auto_active and temp >= g["on"]:
+                        self.auto_active = True
+                        log(f"!! 温度 {temp:.0f}°C >= {g['on']}°C, 自动开启强冷")
+                    elif self.auto_active and temp <= g["off"]:
+                        self.auto_active = False
+                        log(f"温度回落到 {temp:.0f}°C <= {g['off']}°C, 交还 EC 固件曲线")
+                    self.apply()
             except Exception as e:
-                log(f"WARN FanEngine: {e}")
-            self.stop_evt.wait(CURVE_POLL)
+                log(f"WARN ThermalGuard: {e}")
+            self.stop_evt.wait(GUARD_POLL)
+
+    def set_user(self, on: bool) -> dict:
+        with self.lock:
+            self.user_boost = on
+            state_update(fan_boost=on)
+            self.apply()
+            ok = self.ec_boost == self.wanted()
+        return {"ok": ok, "mode": self.mode(), **({} if ok else {"error": "EC 写入失败"})}
+
+    def set_guard(self, enabled=None, on=None, off=None) -> dict:
+        with self.lock:
+            g = dict(self.guard)
+            if enabled is not None:
+                g["enabled"] = bool(enabled)
+            if on is not None:
+                g["on"] = int(on)
+            if off is not None:
+                g["off"] = int(off)
+            if not (60 <= g["off"] < g["on"] <= 95):
+                return {"ok": False, "error": "需满足 60 <= 关闭温度 < 开启温度 <= 95"}
+            self.guard = g
+            state_update(fan_guard=g)
+        return {"ok": True, "fan_guard": g}
+
+    def mode(self):
+        if self.user_boost:
+            return "boost"
+        return "auto-boost" if self.auto_active else "auto"
 
     def shutdown(self):
+        """退出时撤销自动强冷 (仍在高温则保留, 宁可吵不可热); 用户强冷保持原样"""
         self.stop_evt.set()
         with self.lock:
-            if not self.overheat and self.curve is not None:
-                release_manual()
-                log("退出: 风扇交还 EC auto")
+            temp = self.current_temp()
+            if self.auto_active and not self.user_boost and (temp is None or temp < self.guard["on"]):
+                self.auto_active = False
+                self.apply()
+                log("退出: 撤销自动强冷")
 
 
 # ================================================================ RGB 灯效
@@ -543,7 +508,8 @@ def probe_features() -> dict:
         "fn_lock": os.path.exists(f"{inou}/fn_lock"),
         "super_key": os.path.exists(f"{inou}/super_key_enable"),
         "logo_light": False,       # lightbar 寄存器需实测, 默认隐藏
-        "fan_control": FAN_WRITABLE,
+        "fan_boost": ec_read(EC_REG_PROFILE) is not None,
+        "ec_channel": "wkbc" if EC_VIA_WKBC else "mmio",
         "cpu_model": cpu_model(),
         "gpu_name": gpu_name(),
         "cpu_max_mhz": (v := read_text("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq"))
@@ -750,11 +716,6 @@ def charge_limit():
 
 
 def status():
-    fan = engine
-    if not FAN_WRITABLE:
-        fan_mode = "unsupported"
-    else:
-        fan_mode = "curve" if fan.curve else "auto"
     st = {
         "profile": get_profile(),
         "gpu": gpu_info(),
@@ -765,9 +726,10 @@ def status():
         "cpu_temp": (v := hw_read("temp1_input")) and float(v) / 1000,
         "gpu_temp": (v := hw_read("temp2_input")) and float(v) / 1000,
         "charge_limit_pct": charge_limit(),
-        "fan_mode": fan_mode,
-        "fan_curve": (fan.curve and ",".join(f"{t:g}:{p}" for t, p in fan.curve)),
-        "overheat_guard": fan.overheat,
+        "fan_mode": guard.mode(),
+        "fan_boost_ec": guard.ec_boost,
+        "fan_guard": guard.guard,
+        "overheat_guard": guard.auto_active,
         "kbd_rgb": read_text(f"{LED_DIR}/multi_intensity"),
         "kbd_brightness": read_text(f"{LED_DIR}/brightness"),
         "kbd_rainbow": read_text(f"{INOU_DIR}/rainbow_animation") == "1",
@@ -810,14 +772,11 @@ def handle_cmd(cmd):
         return kbd_set(cmd.get("brightness"), cmd.get("rgb"), cmd.get("effect"))
     if op == "fan":
         val = cmd.get("value", "auto")
-        if val in ("auto", "off"):
-            engine.clear_curve()
-            return {"ok": True, "mode": "auto" if FAN_WRITABLE else "unsupported"}
-        try:
-            engine.set_curve(parse_curve(str(val)))
-        except ValueError as e:
-            return {"ok": False, "error": str(e)}
-        return {"ok": True, "mode": "curve", "curve": str(val)}
+        if val in ("auto", "boost"):
+            return guard.set_user(val == "boost")
+        return {"ok": False, "error": "fan 取值: auto | boost (本机不支持自定义曲线)"}
+    if op == "fan_guard":
+        return guard.set_guard(cmd.get("enabled"), cmd.get("on"), cmd.get("off"))
     if op == "mux":
         sub = cmd.get("value", "query")
         if sub == "query":
@@ -918,7 +877,7 @@ def serve():
 
 
 # ================================================================ main
-engine = None
+guard = None
 FEATURES_CACHE = {}
 
 
@@ -939,29 +898,12 @@ def restore_on_boot():
     if prof in PROFILE_BITS:
         r = set_profile(prof)
         log(f"开机恢复性能模式 {prof}: {r.get('ok')}")
-    curve = st.get("fan_curve")
-    if curve and not FAN_WRITABLE:
-        state_update(fan_curve=None)
-    elif curve:
-        try:
-            engine.set_curve(parse_curve(curve))
-            log(f"开机恢复风扇曲线: {curve}")
-        except ValueError as e:
-            log(f"WARN 曲线恢复失败: {e}")
-
-
-def pwm_writable() -> bool:
-    """sysfs 权限位反映驱动是否提供写回调; root 的 os.access 恒为真, 不能用"""
-    if not HW:
-        return False
-    try:
-        return bool(os.stat(f"{HW}/pwm1").st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
-    except OSError:
-        return False
+    if st.get("fan_curve"):
+        state_update(fan_curve=None)     # 旧版用户态曲线的残留状态
 
 
 def main():
-    global HW, engine, ac_led_guard, FAN_WRITABLE
+    global HW, guard, ac_led_guard, EC_VIA_WKBC
     if os.geteuid() != 0:
         print("mrvd 需要 root 运行", file=sys.stderr)
         sys.exit(1)
@@ -970,16 +912,15 @@ def main():
         log("WARN 未找到 uniwill hwmon")
     else:
         log(f"hwmon: {HW}")
-    FAN_WRITABLE = pwm_writable()
-    if not FAN_WRITABLE:
-        log("风扇 PWM 只读: 用户态风扇曲线停用, 风扇由 EC 固件控制")
+    EC_VIA_WKBC = has_wkbc()
+    log(f"EC 写入通道: {'WKBC 命令通道' if EC_VIA_WKBC else 'MMIO 直写 (DSDT 无 WKBC)'}")
 
-    engine = FanEngine()
+    guard = ThermalGuard()
     ac_led_guard = AcLedGuard()
 
     def on_term(sig, frame):
         log(f"收到信号 {sig}, 收尾...")
-        engine.shutdown()
+        guard.shutdown()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, on_term)
@@ -988,7 +929,7 @@ def main():
     FEATURES_CACHE.update(probe_features())
     log(f"机型能力: {json.dumps(FEATURES_CACHE, ensure_ascii=False)}")
 
-    engine.start()
+    guard.start()
     threading.Thread(target=restore_on_boot, daemon=True).start()
     threading.Thread(target=ac_poll_loop, daemon=True).start()
     threading.Thread(target=profile_watch_loop, daemon=True).start()

@@ -7,8 +7,8 @@ mrvctl — 机械革命 Linux 控制台 CLI
   mrvctl status                        整机状态
   mrvctl profile office|balanced|boost 性能模式
   mrvctl fan auto                      风扇交还 EC 固件曲线
-  mrvctl fan curve "40:50,55:90,65:130,75:170,85:200"
-                                       用户态风扇曲线 (仅在本机支持时可用)
+  mrvctl fan boost                     强冷 (EC 全速模式)
+  mrvctl fan guard on|off [开 关]      高温自动强冷, 如 fan guard on 88 78
   mrvctl kbd <0-200>                   键盘背光亮度
   mrvctl kbd color <R> <G> <B>         RGB 颜色 (0-200)
   mrvctl kbd effect solid|rainbow|off  灯效
@@ -62,14 +62,10 @@ def cmd_status(r):
     print(f"CPU/GPU 温度: {fmt(r.get('cpu_temp'), '.0f', '°C')} / {fmt(r.get('gpu_temp'), '.0f', '°C')}")
     print(f"风扇       : 主 {fmt(r.get('fan1_rpm'))} RPM  副 {fmt(r.get('fan2_rpm'))} RPM (pwm={fmt(r.get('pwm1'))})")
     mode = r.get("fan_mode")
-    if mode == "unsupported":
-        desc = "EC 固件控制 (本机暂不支持自定义)"
-    elif mode == "curve":
-        desc = f"curve [{r.get('fan_curve')}]"
-    else:
-        desc = mode
-    guard = "  <超温>" if r.get("overheat_guard") else ""
-    print(f"风扇模式   : {desc}{guard}")
+    desc = {"auto": "EC 固件曲线", "boost": "强冷 (全速)", "auto-boost": "高温自动强冷中"}.get(mode, mode)
+    g = r.get("fan_guard") or {}
+    guard = f"开 ≥{g.get('on')}°C / 关 ≤{g.get('off')}°C" if g.get("enabled") else "关闭"
+    print(f"风扇模式   : {desc}  (高温自动强冷: {guard})")
     print(f"限充阈值   : {fmt(r.get('charge_limit_pct'), '', '%', 'EC 读取失败')}")
     effect = "彩虹" if r.get("kbd_rainbow") else "单色"
     print(f"键盘灯     : {effect} RGB({r.get('kbd_rgb')}) 亮度 {r.get('kbd_brightness')}")
@@ -95,11 +91,18 @@ def main():
         r = call({"op": "profile", "value": rest[0]})
         done(r, f"已切换: {r.get('profile')}")
     elif op == "fan":
-        if rest and rest[0] in ("auto", "off"):
+        if rest and rest[0] == "auto":
             done(call({"op": "fan", "value": "auto"}), "风扇已交还 EC 固件曲线")
-        elif len(rest) > 1 and rest[0] == "curve":
-            done(call({"op": "fan", "value": rest[1]}), f"曲线已启用: {rest[1]}")
-        sys.exit('用法: mrvctl fan auto | fan curve "T:P,..."')
+        elif rest and rest[0] == "boost":
+            done(call({"op": "fan", "value": "boost"}), "强冷已开启")
+        elif len(rest) >= 2 and rest[0] == "guard" and rest[1] in ("on", "off"):
+            cmd = {"op": "fan_guard", "enabled": rest[1] == "on"}
+            if len(rest) >= 4 and rest[2].isdigit() and rest[3].isdigit():
+                cmd.update(on=int(rest[2]), off=int(rest[3]))
+            r = call(cmd)
+            g = r.get("fan_guard") or {}
+            done(r, f"高温自动强冷: {'开' if g.get('enabled') else '关'} (≥{g.get('on')}°C 开启, ≤{g.get('off')}°C 关闭)")
+        sys.exit("用法: mrvctl fan auto | fan boost | fan guard on|off [开启温度 关闭温度]")
     elif op == "kbd":
         if len(rest) >= 4 and rest[0] == "color":
             r = call({"op": "kbd", "rgb": rest[1:4]})

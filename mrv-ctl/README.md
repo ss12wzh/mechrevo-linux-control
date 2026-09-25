@@ -19,13 +19,13 @@ Ubuntu 24.04 下对标 Windows 版控制台（L-Mechrevo / NvpwrControl）的开
 | 功能 | 状态 | 说明 |
 |---|---|---|
 | GPU 功耗解锁（50W→115W） | ✅ 一期 | nvidia-powerd（NVPCF/Dynamic Boost），install.sh 自动修复 Ubuntu 打包缺失的 unit 与 D-Bus policy |
-| 性能模式 office/balanced/boost | ✅ 一期 | EC 0x0751 位操作（acpi_call → `_SB.INOU.ECRW`），写后读回，开机恢复 |
-| 风扇曲线 | ❌ 暂不可用（专项进行中） | 本机 hwmon `pwm1/pwm2` 为只读，用户态引擎写不进去，3.1.1 起自动停用并如实上报。EC `0x078E` bit6=1，自定义风扇表路线可行，见重构计划第六节 |
-| 超温兜底 | ⚠️ 仅监控 | 风扇不可由软件控制时只记录告警，热保护由 EC 固件负责 |
+| 性能模式 office/balanced/boost | ✅ 一期（语义待复核） | EC 0x0751 位操作 + CPU EPP 联动，写后读回，开机恢复。注意：上游驱动把 0x0751 定义为风扇模式寄存器（TURBO/HIGH/BOOST/USER），见下方"风扇控制" |
+| 风扇强冷 | ✅ 3.3.0 | 0x0751 bit6（FAN_MODE_BOOST）全速模式，经 WKBC 命令通道写入；实测 2 秒内 2900→4690 RPM，清位 3 秒内交还 EC 曲线 |
+| 高温自动强冷 | ✅ 3.3.0 | 默认 ≥88°C 自动全速、≤78°C 交还 EC（迟滞），阈值可调；每 2 秒校正一次 EC 状态 |
+| 自定义风扇曲线 | ❌ 本机 EC 不支持 | 7 次受控实验（`docs/probe/fan-experiment-*.log`）：自定义风扇表 CPU 不读、GPU 启用后输出 0；0x1804/0x1809 直写被 EC 覆盖；FAN_LEVEL 被忽略 |
 | 键盘背光 + RGB 颜色 | ✅ 二期 | multicolor LED，亮度 0-200 + RGB 各通道 0-200 |
 | 电池限充 | ✅ 一期 | EC 0x07B9 |
 | 独显直连 Mux | ✅ 二期（实验） | DSDT IGPS/DGPS：查询可用；标准/直连切换已实现但需重启，未在压力下验证；集显模式未实现 |
-| 风扇曲线 EC 侧 16 点表 | ❌ 评估后放弃 | 0x0F00-0x0F5F 需私有 WMI 命令端口写时序，读已破译写未完全破译；用户态曲线引擎已等效覆盖 |
 | 超上限 TGP（120-140W） | ⚠️ 评估结论 | CTGP/DB 偏移寄存器（0x0744/0x0746）可写但 NVML 上限稳定 115W OEM 值；与 NvpwrControl "experimental" 定位一致，遗留研究 |
 
 ## 安装 / 使用
@@ -35,8 +35,9 @@ sudo ./install.sh
 
 mrvctl status                     # 整机状态
 mrvctl profile boost              # 狂暴
-mrvctl fan curve "40:50,55:90,65:130,75:170,85:200"   # 风扇曲线
+mrvctl fan boost                  # 强冷 (全速)
 mrvctl fan auto                   # 交还 EC 固件曲线
+mrvctl fan guard on 88 78         # 高温自动强冷: ≥88°C 开, ≤78°C 关
 mrvctl kbd color 0 120 200        # RGB 蓝
 mrvctl kbd 150                    # 亮度
 mrvctl charge 80                  # 限充
@@ -49,9 +50,9 @@ mrvctl mux query                  # 独显直连状态
 mrvctl (CLI, 免 root)
    └─ /run/mrvd/mrvd.sock
         └─ mrvd (root 守护进程)
-             ├─ EC 写入仲裁: 白名单 + 基线 + 写后读回
+             ├─ EC 写入仲裁: 白名单 + 基线 + WKBC 命令通道写入 + MMIO 读回
              ├─ 性能模式 / 限充: EC 0x0751 / 0x07B9
-             ├─ 风扇引擎: 曲线插值 + 缓降 + 超温兜底 (单线程防打架)
+             ├─ ThermalGuard: 手动强冷 + 高温自动强冷 (0x0751 bit6, 迟滞)
              ├─ RGB: multicolor LED sysfs
              ├─ Mux: DSDT IGPS/DGPS (acpi_call)
              └─ 硬件层: acpi_call + uniwill_laptop(force=1) + nvidia-powerd
@@ -59,8 +60,8 @@ mrvctl (CLI, 免 root)
 
 ## 安全设计
 
-1. EC 写白名单（0x0751/0x07B9/0x0741），未知地址拒绝。
-2. 基线保存 + 位级读回验证。
+1. EC 写白名单（0x0751/0x07B9），未知地址拒绝；0x0741 bit0（ENABLE_MANUAL_CTRL）由内核 `uniwill_laptop` 管理，mrvd 不再触碰（旧版会把它清掉）。
+2. 基线保存 + 位级读回验证；写入走 `\_SB.AMW0.WKBC`（由 EC 固件执行，与 OEM 软件一致），DSDT 无此方法时回退 MMIO。
 3. `/proc/acpi/call` 串行化（线程锁 + `/run/mrvd/acpi_call.lock` flock），外部脚本也须持同一把锁。
 4. IPC 鉴权（SO_PEERCRED）：读状态任何人；写操作需 root 或 sudo/admin/wheel/mrv 组成员。
 5. INOU sysfs 开关白名单（fn_lock / super_key_enable / breathing_in_suspend / touchpad_toggle_enable）。
@@ -77,11 +78,20 @@ mrvctl (CLI, 免 root)
 
 ## 一期遗留 → 二期状态
 
-- ~~风扇曲线~~ ✅ 已以用户态引擎实现
+- ~~风扇曲线~~ 用户态引擎写的是只读 PWM，从未生效；3.3.0 改为强冷 + 高温自动强冷
 - ~~RGB 灯效~~ ✅ 基础色/亮度（动态灯效可后续加）
 - ~~Mux 切换~~ ✅ 命令实现（切换需重启，实测风险自担）
 - 超上限 TGP：遗留研究（需 EC/NVPCF 联合调参，暂无安全路径）
 - acpi_call 替换为自研内核模块：待做（当前通道稳定，优先级降低）
+
+## v3.3.0 变更（2026-09-25，风扇）
+
+- 新增：风扇强冷开关（CLI `mrvctl fan boost|auto`，GUI "控制 → 风扇"）
+- 新增：高温自动强冷（默认 ≥88°C 开、≤78°C 关，`mrvctl fan guard on|off [开 关]`），替换原先写不进去的"超温兜底"；
+  守护进程退出时撤销自动强冷（仍处高温则保留），手动强冷跨重启保持
+- 变更：EC 写入改走 WKBC 命令通道；不再清除 0x0741 bit0；删除永远无法生效的 PWM 曲线引擎
+- 变更：切档与强冷共用一把锁读改写 0x0751，互不覆盖
+- 新增：`scripts/fan-experiment.py` 受控风扇实验脚本与 7 份实验日志
 
 ## v3.2.0 变更（2026-09-25，GUI 重做）
 
@@ -151,13 +161,24 @@ mrvctl (CLI, 免 root)
 **结论**：Linux 下 GPU 功耗墙由 `nvidia-powerd`（NVPCF）固定协商，EC 档位无法改变。
 Windows 版能改是因为其控制台**直接改 NVIDIA 驱动内部运行时对象**（即 NvpwrControl 项目做法），
 Linux 无此通道。**115W（OEM 上限）是 Linux 可达到的最优值**（修复前为 50W）。
-档位切换的实际作用域：CPU 能效策略 + 风扇曲线 + 灯效 + EC 内部功耗预算。
+档位切换的实际作用域：CPU 能效策略 + 灯效 + EC 风扇模式位。
 
-## 风扇控制状态
+## 风扇控制（2026-09-25 实测结论）
 
-- 系统内核 `uniwill_laptop` 驱动：提供温度/转速**只读** hwmon（无 write 回调，pwm 只读）
-- 已额外编译安装 tuxedo 三件套（DKMS `tuxedo-mrv`，白名单已 patch 允许 MECHREVO）：
-  `/dev/tuxedo_io` 可用，`uniwill_wmi` 提供 WMI 命令端口全空间 EC 读写
-- 但 `W_UW_FANSPEED` 写入未生效（tuxedo 对未知机型 barebone ID 的特性 gating +
-  0x0Fxx 自定义表使能序列），风扇曲线暂不可用，属跨机型适配遗留项
-- 保留：温度/转速监控 + 超温兜底逻辑
+寄存器语义以主线 `drivers/platform/x86/uniwill/uniwill-acpi.c` 为准：
+
+| 地址 | 含义 | 本机结论 |
+|---|---|---|
+| 0x0751 | MANUAL_FAN_CTRL：bit0-2 FAN_LEVEL / bit4 TURBO / bit5 HIGH / bit6 BOOST / bit7 USER | **bit6 全速模式有效**；FAN_LEVEL 被忽略 |
+| 0x0741 bit0 | ENABLE_MANUAL_CTRL，内核驱动加载时置位、卸载时清除 | 置位后 EC 才会读取自定义风扇表 |
+| 0x075B / 0x075C | 风扇 PWM 读数（hwmon pwm1/2 的来源，0-200） | 只读 |
+| 0x078E bit6 | UNIVERSAL_FAN_CTRL 能力位 | 本机为 1，但实际不可用（见下） |
+| 0x07C5 bit7 / 0x07C6 bit2 | 双表分离 / 启用自定义表 | 启用后 GPU 风扇被置 0，CPU 风扇不受影响 |
+| 0x0F00-0x0F5F | CPU / GPU 各 16 区间风扇表 | 格式与 tuxedo 不一致，未破解 |
+| 0x1804 / 0x1809 | ITE EC 硬件 PWM 占空比（周期 0x1801=200） | 被 EC 风扇回路持续覆盖 |
+
+实验记录：`docs/probe/fan-experiment-1.log` … `fan-experiment-7-level.log`，脚本 `scripts/fan-experiment.py`
+（基线存盘、独立看门狗、超温 / 低转速中止、每次写入读回；7 次实验全部恢复成功）。
+
+- EC 写入必须走 WKBC 命令通道：同样的表写入，MMIO 直写被 EC 完全忽略。
+- `tuxedo-drivers` 在本机读不到 barebone ID，特性探测失败，所以它的风扇 API 从未真正写过表。
