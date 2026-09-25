@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""按窗口标题或 0x 开头的窗口 ID 截取 X11 窗口 (开发用): shot.py <标题|0xID> <输出.png>"""
+"""截取 X11 窗口 (开发用): shot.py <标题|0xID> <输出.png> [--screen]
+--screen: 从屏幕 (根窗口) 按窗口位置裁切, 包含合成后的桌面背景, 用于检查透明 / 阴影效果"""
 import subprocess
 import sys
 
@@ -15,6 +16,10 @@ else:
     info = subprocess.run(["xwininfo", "-name", title], capture_output=True, text=True).stdout
     xid = next(int(line.split()[3], 16) for line in info.splitlines() if "Window id:" in line)
 w = GdkX11.X11Window.foreign_new_for_display(GdkX11.X11Display.get_default(), xid)
-pb = Gdk.pixbuf_get_from_window(w, 0, 0, w.get_width(), w.get_height())
+if "--screen" in sys.argv:
+    _, x, y = w.get_origin()
+    pb = Gdk.pixbuf_get_from_window(Gdk.get_default_root_window(), x, y, w.get_width(), w.get_height())
+else:
+    pb = Gdk.pixbuf_get_from_window(w, 0, 0, w.get_width(), w.get_height())
 pb.savev(out, "png", [], [])
-print(out, w.get_width(), w.get_height())
+print(out, pb.get_width(), pb.get_height())

@@ -27,7 +27,7 @@ except (ValueError, ImportError):
     HAS_INDICATOR = False
 
 SOCK_PATH = "/run/mrvd/mrvd.sock"
-VERSION = "3.3.1"
+VERSION = "3.3.2"
 CONFIG_PATH = os.path.join(GLib.get_user_config_dir(), "mrv-ctl", "gui.json")
 SHADOW_MARGIN = 14              # 透明窗口外沿, 用来画面板阴影
 
@@ -54,6 +54,9 @@ CSS = """
 @define-color mrv_red #f47788;
 @define-color mrv_orange #f4a073;
 
+/* 透明窗口本身不画任何东西, 圆角面板和阴影都在 SHADOW_MARGIN 以内 */
+window.mrv-window, window.mrv-window.background { background-color: transparent; background-image: none; }
+
 .shell, .bubble, popover.mrv-menu {
   font-family: "DejaVu Sans Mono", "Noto Sans CJK SC", monospace;
   font-size: 11px;
@@ -69,7 +72,8 @@ CSS = """
   background-image:
     radial-gradient(circle farthest-corner at 12% 0%, rgba(86, 108, 196, 0.26), transparent 58%),
     radial-gradient(circle farthest-corner at 100% 100%, rgba(66, 84, 168, 0.20), transparent 62%);
-  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.36);
+  /* 偏移 + 模糊必须小于 SHADOW_MARGIN, 否则阴影在窗口边界被截断, 形成一圈暗色直边 */
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.30);
 }
 .shell.opaque { border-radius: 0; box-shadow: none; background-color: rgb(40, 44, 50); }
 
@@ -153,7 +157,8 @@ button.win-btn:hover { opacity: 1; background-color: rgba(255, 255, 255, 0.07); 
 .shell progressbar.crit progress { background-color: @mrv_red; }
 
 /* ---------- 滑条 (与进度条同一套轨道) */
-.shell scale { padding: 6px 0; min-height: 14px; }
+/* 左右留出滑块半径, 否则滑块在两端只露出一半 */
+.shell scale { padding: 6px 7px; min-height: 14px; }
 .shell scale trough {
   min-height: 6px; border-radius: 3px; border: none;
   background-image: none; background-color: rgba(4, 8, 13, 0.46);
@@ -235,7 +240,7 @@ popover.mrv-menu separator { margin: 3px 4px; background-color: rgba(232, 238, 2
   border: 1px solid rgba(232, 238, 244, 0.14);
   background-color: rgba(40, 44, 50, 0.93);
   background-image: radial-gradient(circle farthest-corner at 0% 0%, rgba(86, 108, 196, 0.24), transparent 70%);
-  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.36);
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.30);
 }
 .bubble.opaque { border-radius: 0; box-shadow: none; }
 .bubble-val {
@@ -303,6 +308,7 @@ def icon(name, size=12, cls="section-icon"):
 
 def enable_rgba(win):
     """透明窗口 + 面板自绘圆角; 没有合成器时返回 False, 调用方退化为不透明直角"""
+    add_class(win, "mrv-window")
     screen = win.get_screen()
     visual = screen.get_rgba_visual()
     if visual and screen.is_composited():
