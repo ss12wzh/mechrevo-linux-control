@@ -35,7 +35,10 @@ BASELINE_FILE = f"{STATE_DIR}/baseline.json"
 ACPI_CALL = "/proc/acpi/call"
 
 # EC 寄存器白名单 (0x0741 bit0 由内核 uniwill_laptop 管理, 不在此列)
-EC_REG_PROFILE = 0x0751     # 上游驱动称 MANUAL_FAN_CTRL: bit4 TURBO / bit5 HIGH / bit6 BOOST / bit7 USER
+# 0x0751: DSDT 称 bit4 TBME (狂暴) / bit7 UFME (办公静音), 都为 0 即平衡; 上游驱动称 MANUAL_FAN_CTRL
+# (bit4 TURBO / bit5 HIGH / bit6 BOOST / bit7 USER). EC 固件据此切换 CPU 功耗墙与 NVPCF 平台参数,
+# 并自行触发 SCI (_Q83/_Q84/_Q9C) 通知 NVIDIA 驱动 (docs/perf/2-ab.jsonl, 3-downward.jsonl)
+EC_REG_PROFILE = 0x0751
 EC_REG_CHARGE = 0x07B9
 EC_WHITELIST = {EC_REG_PROFILE, EC_REG_CHARGE}
 
@@ -46,6 +49,17 @@ FAN_BOOST_BIT = 0x40        # 全速模式; 本机唯一实测有效的风扇写
 GUARD_POLL = 2.0            # 温度采样周期 (秒)
 GUARD_DEFAULT = {"enabled": True, "on": 88, "off": 78}   # 高温自动强冷: 超过 on 开启, 回落到 off 关闭
 PWM_MAX = 200               # multi_intensity 各通道上限
+
+# EC 按档位给出的 NVPCF 平台参数 (只读, 单位 W; DSDT 中乘 8 后写入 NPCF)
+EC_REG_CTWA = 0x0788        # GPU cTGP 基础功耗 -> NPCF.ACBT
+EC_REG_DBAP = 0x07D5        # Dynamic Boost -> NPCF.AMAT
+EC_REG_ETPP = 0x07F7        # 平台总处理功耗 TPP -> NPCF.ATPP
+
+# 各档 CPU 封装功耗墙实测值 (W). EC 非自定义模式下 APL1/APL2 (0x0783/0x0784) 为 0, 功耗墙由固件内部决定,
+# 无寄存器可读, 只能按机型记录实测结果 (docs/perf/*.jsonl, openssl 32 进程满载稳态)
+MEASURED_CPU_PPT = {
+    "CANGLONG Series-M6DR55": {"office": 45, "balanced": 87, "boost": 130},
+}
 
 LED_DIR = "/sys/class/leds/uniwill:multicolor:status"
 INOU_DIR = "/sys/devices/platform/INOU0000:00"
@@ -198,9 +212,8 @@ def get_profile():
         bits, f"custom(0x{v:02X})")
 
 
-# 档位联动: 每个档位附带 CPU 性能策略 / 灯效
-# 说明: Linux 下 GPU 功耗墙由 nvidia-powerd (NVPCF) 固定, EC 档位无法改变它
-#       (Windows 能改是因为其控制台直接改驱动内部对象, Linux 无此通道)
+# 档位联动: 功耗墙由 EC 固件随档位位切换; 这里只附带 CPU EPP 与灯效.
+# EPP 不影响满载功耗 (A/B 实测), 只影响轻负载时的频率策略与能耗
 PROFILE_ACTIONS = {
     "office": {"epp": "power", "kbd_brightness": 30, "kbd_rainbow": False},
     "balanced": {"epp": "balance_performance", "kbd_brightness": 80, "kbd_rainbow": False},
@@ -514,6 +527,7 @@ def probe_features() -> dict:
         "gpu_name": gpu_name(),
         "cpu_max_mhz": (v := read_text("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq"))
                        and int(v) // 1000,
+        "cpu_ppt_table": cpu_ppt_table(),
     }
     # mux 能力: DGPS 查询成功即支持
     out = acpi_method(f"{MUX_PATH}.DGPS")
@@ -715,9 +729,21 @@ def charge_limit():
     return (v & 0x7F) or 100
 
 
+def cpu_ppt_table() -> dict:
+    board = read_text("/sys/class/dmi/id/board_name") or ""
+    return next((v for k, v in MEASURED_CPU_PPT.items() if board.startswith(k)), {})
+
+
+def platform_info(profile: str) -> dict:
+    return {"tpp_w": ec_read(EC_REG_ETPP), "db_w": ec_read(EC_REG_DBAP), "ctgp_base_w": ec_read(EC_REG_CTWA),
+            "cpu_ppt_w": FEATURES_CACHE.get("cpu_ppt_table", {}).get(profile)}
+
+
 def status():
+    profile = get_profile()
     st = {
-        "profile": get_profile(),
+        "profile": profile,
+        "platform": platform_info(profile),
         "gpu": gpu_info(),
         "cpu": cpu_info(),
         "fan1_rpm": (v := hw_read("fan1_input")) and int(v),

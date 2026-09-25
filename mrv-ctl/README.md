@@ -19,7 +19,7 @@ Ubuntu 24.04 下对标 Windows 版控制台（L-Mechrevo / NvpwrControl）的开
 | 功能 | 状态 | 说明 |
 |---|---|---|
 | GPU 功耗解锁（50W→115W） | ✅ 一期 | nvidia-powerd（NVPCF/Dynamic Boost），install.sh 自动修复 Ubuntu 打包缺失的 unit 与 D-Bus policy |
-| 性能模式 office/balanced/boost | ✅ 一期（语义待复核） | EC 0x0751 位操作 + CPU EPP 联动，写后读回，开机恢复。注意：上游驱动把 0x0751 定义为风扇模式寄存器（TURBO/HIGH/BOOST/USER），见下方"风扇控制" |
+| 性能模式 office/balanced/boost | ✅ 3.3.1 复核 | EC 0x0751 档位位 + CPU EPP 联动；实测 CPU 功耗墙 45 / 87 / 130 W，GPU 上限 105 / 85 / 115 W（见"实测结论：性能档"） |
 | 风扇强冷 | ✅ 3.3.0 | 0x0751 bit6（FAN_MODE_BOOST）全速模式，经 WKBC 命令通道写入；实测 2 秒内 2900→4690 RPM，清位 3 秒内交还 EC 曲线 |
 | 高温自动强冷 | ✅ 3.3.0 | 默认 ≥88°C 自动全速、≤78°C 交还 EC（迟滞），阈值可调；每 2 秒校正一次 EC 状态 |
 | 自定义风扇曲线 | ❌ 本机 EC 不支持 | 7 次受控实验（`docs/probe/fan-experiment-*.log`）：自定义风扇表 CPU 不读、GPU 启用后输出 0；0x1804/0x1809 直写被 EC 覆盖；FAN_LEVEL 被忽略 |
@@ -83,6 +83,13 @@ mrvctl (CLI, 免 root)
 - ~~Mux 切换~~ ✅ 命令实现（切换需重启，实测风险自担）
 - 超上限 TGP：遗留研究（需 EC/NVPCF 联合调参，暂无安全路径）
 - acpi_call 替换为自研内核模块：待做（当前通道稳定，优先级降低）
+
+## v3.3.1 变更（2026-09-25，性能档复核）
+
+- 复核：三档性能释放实测全部生效（旧 README "切档无差异"结论作废，见"实测结论：性能档"）
+- 新增：`status.platform`（EC 当前 TPP / 动态加速 / GPU cTGP 基础值 + 本机型实测 CPU 功耗墙）；`mrvctl status` 增加"平台参数"行
+- GUI：CPU 功耗条按当前档位功耗墙计算比例并标注"实测"；GPU 分区显示动态加速；性能档按钮悬停提示各档功耗墙
+- 新增：`scripts/perf-sample.py` / `perf-bench.sh` / `perf-ab.sh` / `perf-report.py` 性能释放测量工具与 `docs/perf/` 数据
 
 ## v3.3.0 变更（2026-09-25，风扇）
 
@@ -148,20 +155,24 @@ mrvctl (CLI, 免 root)
 - 档位 → 风扇曲线 + 键盘灯亮度/彩虹
 - **物理性能键检测**：固件自行切换 EC 档位而不通知 Linux，mrvd 轮询感知并自动应用联动
 
-## 实测结论：GPU 功耗墙（重要）
+## 实测结论：性能档（2026-09-25 复核，推翻旧结论）
 
-| 验证 | 结果 |
-|---|---|
-| 三档切换后 NVML | office/balanced/boost 全为 100W(current) / 115W(max) |
-| 负载下实际功耗 | office 14.21W vs boost 13.84W（无差异，glmark2+NVIDIA 渲染） |
-| CTGP 偏移（EC 0x0744+0x0743） | 13.19 / 13.11 / 13.63W（噪声级，无效） |
-| `nvidia-smi -pl` | 驱动拒绝（笔记本封死） |
-| nvidia-powerd 重启重协商 | 无变化 |
+旧版这里写"三档切换后 GPU 功耗无差异、EC 档位无法改变功耗墙"——**结论错误**：当时的 GPU 负载（glmark2 默认分辨率）只有约 14W，
+远没碰到任何功耗墙。用满载复测后，三档在 CPU 与 GPU 两侧都真实生效。
 
-**结论**：Linux 下 GPU 功耗墙由 `nvidia-powerd`（NVPCF）固定协商，EC 档位无法改变。
-Windows 版能改是因为其控制台**直接改 NVIDIA 驱动内部运行时对象**（即 NvpwrControl 项目做法），
-Linux 无此通道。**115W（OEM 上限）是 Linux 可达到的最优值**（修复前为 50W）。
-档位切换的实际作用域：CPU 能效策略 + 灯效 + EC 风扇模式位。
+最终验收（3.3.1 安装版，`scripts/perf-bench.sh`，CPU = `openssl speed` 32 进程 45 秒，GPU = `glmark2 --off-screen --size 3840x2160 -b terrain` 40 秒；原始数据 `docs/perf/4-final.jsonl`）：
+
+| 档位 | CPU 满载稳态 / 峰值 | CPU 频率 | Tctl 最高 | GPU 负载功耗 | GPU 生效上限 | EC TPP / 动态加速 |
+|---|---|---|---|---|---|---|
+| 静音 | 45.6 / 45.8 W | 2064 MHz | 66°C | 90.6 W | 105 W | 55 / 5 W |
+| 平衡 | 86.9 / 86.9 W | 4281 MHz | 80°C | 83.9 W | 85 W | 55 / 5 W |
+| 狂暴 | 122.7 / 130.7 W | 4656 MHz | 97°C | 94.4 W | 115 W | 105 / 15 W |
+
+- **CPU 功耗墙由 EC 固件按档位位切换**（0x0751 bit7 UFME / bit4 TBME），EC 非自定义模式下 APL1/APL2 寄存器为 0，功耗墙无寄存器可读，所以 mrvd 按机型记录实测值（`MEASURED_CPU_PPT`）。狂暴档 45 秒稳态低于峰值是 Tctl 97°C 温度墙所致。
+- **EPP 不影响满载功耗**：A/B 对照（`docs/perf/2-ab.jsonl`）中静音位 + EPP performance 仍为 45.7W，平衡位 + EPP power 仍为 86.8W。
+- **GPU 侧**：EC 切档后自行触发 SCI（`_Q83/_Q84/_Q9C`）把 TPP / 动态加速 / cTGP 基础值通知 NVIDIA 驱动；升档、降档都能跟随（`docs/perf/3-downward.jsonl`）。静音档 GPU 上限（105W）反而高于平衡档（85W），是 Dynamic Boost 在同一平台预算内把 CPU 省下的功耗分给了 GPU。
+- **MMIO 与 WKBC 写 0x0751 效果相同**（A/B 对照 A1/A2），EC 对模式位的直接改写会感知（与风扇表不同）。
+- `nvidia-smi -pl` 仍被驱动拒绝；超过 OEM 115W 上限仍无安全通道。
 
 ## 风扇控制（2026-09-25 实测结论）
 

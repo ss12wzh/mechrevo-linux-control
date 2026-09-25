@@ -51,6 +51,10 @@ def fmt(v, spec="", unit="", none="--"):
 
 def cmd_status(r):
     print(f"性能模式   : {r.get('profile')}")
+    p = r.get("platform") or {}
+    cap = f"CPU 功耗墙 ≈{p['cpu_ppt_w']} W (实测) · " if p.get("cpu_ppt_w") else ""
+    print(f"平台参数   : {cap}TPP {fmt(p.get('tpp_w'), '', ' W')} · 动态加速 {fmt(p.get('db_w'), '', ' W')}"
+          f" · GPU 基础 {fmt(p.get('ctgp_base_w'), '', ' W')}")
     g = r.get("gpu", {})
     if g.get("suspended"):
         print("GPU        : 独显休眠中")

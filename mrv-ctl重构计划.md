@@ -344,7 +344,8 @@ tuxedo 的用法是把表压成"一个大区间 + 用户态实时改转速"，�
 
 - 两个现成的 `ctgp_offset` 接口走的是驱动路径，可能会通知 NVPCF 重新协商，和 README 里直写 EC `0x0744` 的效果不一定相同，值得复测一次（不承诺结果）。
 - 把 TCC 原有的 CPU 频率上限 / 调速器设置按需补进档位联动。
-- **复核"性能档"的真实含义**：上游驱动把 0x0751 定义为风扇模式寄存器（office=USER+HIGH，boost=TURBO），这与 README 里"切档后 GPU 功耗无差别"的实测一致。真正的性能模式可能走 DSDT 的 `PMSF()` / `INOU.CSTM` / `ATPP`（OEMG 子命令 0x0500），需要对照 L-Mechrevo 的调用重新确认，再决定档位改写哪里。
+- ~~复核"性能档"的真实含义~~ **已完成（3.3.1）**：DSDT 中 0x0751 bit4/bit7 即 TBME/UFME 性能模式位，EC 固件据此切换 CPU 功耗墙并自行通知 NVPCF；满载实测三档 CPU 45 / 87 / 130 W、GPU 上限 105 / 85 / 115 W，旧"无差异"结论源于 GPU 负载过轻。详见 README"实测结论：性能档"与 `docs/perf/`。
+- 可选后续：自定义模式（`CUME` 0x0727 bit6 + APL1/APL2/APL4 0x0783-0x0785，L-Mechrevo 实测需先切自定义模式才能写入），以及 CPU 侧 `EC0.PLIM` → `ALIB(0x0C)` DPTCi 通道；静音档若要同时压住 GPU，可评估 TPP offset（0x0745）。
 
 ### 阶段 5：打包统一（约 3 天）
 

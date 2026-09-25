@@ -27,7 +27,7 @@ except (ValueError, ImportError):
     HAS_INDICATOR = False
 
 SOCK_PATH = "/run/mrvd/mrvd.sock"
-VERSION = "3.3.0"
+VERSION = "3.3.1"
 CONFIG_PATH = os.path.join(GLib.get_user_config_dir(), "mrv-ctl", "gui.json")
 SHADOW_MARGIN = 14              # 透明窗口外沿, 用来画面板阴影
 
@@ -990,6 +990,9 @@ class MrvApp:
 
     def _apply_title(self, st):
         prof = st.get("profile")
+        caps = self.feats.get("cpu_ppt_table") or {}
+        for key, b in self.profile_tabs.buttons.items():
+            b.set_tooltip_text(f"CPU 功耗墙约 {caps[key]} W (本机实测)" if key in caps else None)
         if prof in PROFILE_NAMES:
             self.profile_tabs.select(prof)
         else:
@@ -1016,11 +1019,15 @@ class MrvApp:
         self.sec_cpu.plan.set_text(f.get("cpu_model", ""))
         avg, peak, pw = c.get("freq_avg_mhz"), c.get("freq_max_mhz"), c.get("power_w")
         max_mhz = f.get("cpu_max_mhz") or 5500
+        plat = st.get("platform") or {}
+        cap = plat.get("cpu_ppt_w")
         self.sec_cpu.meta.set_text(" · ".join(x for x in (
-            f"{ct:.0f}°C" if ct is not None else "", f"{pw:.1f} W" if pw is not None else "",
-            f"最高 {max_mhz} MHz") if x))
+            f"{ct:.0f}°C" if ct is not None else "",
+            f"功耗墙 ≈{cap} W" if cap else "", f"最高 {max_mhz} MHz") if x))
         self.m_cpu["temp"].update(f"{ct:.0f}°C" if ct is not None else "—", (ct or 0) / 100, self._temp_level(ct))
-        self.m_cpu["power"].update(f"{pw:.1f} W" if pw is not None else "—", (pw or 0) / 120)
+        self.m_cpu["power"].update(f"{pw:.1f} W" if pw is not None else "—", (pw or 0) / (cap or 120),
+                                   "warn" if cap and pw and pw >= cap * 0.95 else None,
+                                   f"{prof}档功耗墙 ≈{cap} W (实测)" if cap else None)
         self.m_cpu["freq"].update(f"{avg} MHz" if avg else "—", (avg or 0) / max_mhz)
         self.m_cpu["peak"].update(f"{peak} MHz" if peak else "—", (peak or 0) / max_mhz)
 
@@ -1036,7 +1043,8 @@ class MrvApp:
             used, total = g.get("mem_used_mb"), g.get("mem_total_mb")
             self.sec_gpu.meta.set_text(" · ".join(x for x in (
                 f"{gt:.0f}°C" if gt is not None else "",
-                f"{draw:.1f} W" if draw is not None else "") if x))
+                f"{draw:.1f} W" if draw is not None else "",
+                f"动态加速 {plat['db_w']} W" if plat.get("db_w") is not None else "") if x))
             self.m_gpu["temp"].update(f"{gt:.0f}°C" if gt is not None else "—", (gt or 0) / 100, self._temp_level(gt))
             self.m_gpu["util"].update(f"{util:.0f}%" if util is not None else "—", (util or 0) / 100)
             if used is not None and total:
