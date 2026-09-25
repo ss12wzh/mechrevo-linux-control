@@ -6,7 +6,9 @@
 - **40/50 系多机型兼容层**：mrvd 启动时自动探测机型能力（性能模式/限充/风扇/RGB/彩虹/呼吸/FnLock/超级键/Mux），UI 按能力自适应渲染，不支持的区块自动隐藏
 - **动态灯效**：流畅彩虹（固件动画）、单色（颜色选择器取色）、离电自动关灯（插电恢复）
 
-构建 deb：`bash build-deb.sh` → `mrv-ctl_3.0.0_all.deb`
+构建 deb：`bash build-deb.sh` → `dist/mrv-ctl_<版本>_all.deb`；安装：`sudo ./install.sh`（构建并安装 deb，唯一安装路径）
+
+> 本机不再需要 TUXEDO Control Center / tuxedo-drivers：它们在本机风扇 API 不可用，且会与 mrvd 互相覆盖 CPU 策略和性能档。所需接口全部由内核自带的 `uniwill_laptop` 提供。
 
 
 Ubuntu 24.04 下对标 Windows 版控制台（L-Mechrevo / NvpwrControl）的开源控制台。
@@ -18,11 +20,11 @@ Ubuntu 24.04 下对标 Windows 版控制台（L-Mechrevo / NvpwrControl）的开
 |---|---|---|
 | GPU 功耗解锁（50W→115W） | ✅ 一期 | nvidia-powerd（NVPCF/Dynamic Boost），install.sh 自动修复 Ubuntu 打包缺失的 unit 与 D-Bus policy |
 | 性能模式 office/balanced/boost | ✅ 一期 | EC 0x0751 位操作（acpi_call → `_SB.INOU.ECRW`），写后读回，开机恢复 |
-| 风扇曲线（用户态引擎） | ✅ 二期 | mrvd 周期采样温度→插值 PWM→缓降防振荡；崩溃/退出自动交还 EC auto |
-| 超温兜底 | ✅ 一期 | >93°C 强制满速，回落自动恢复 |
+| 风扇曲线 | ❌ 暂不可用（专项进行中） | 本机 hwmon `pwm1/pwm2` 为只读，用户态引擎写不进去，3.1.1 起自动停用并如实上报。EC `0x078E` bit6=1，自定义风扇表路线可行，见重构计划第六节 |
+| 超温兜底 | ⚠️ 仅监控 | 风扇不可由软件控制时只记录告警，热保护由 EC 固件负责 |
 | 键盘背光 + RGB 颜色 | ✅ 二期 | multicolor LED，亮度 0-200 + RGB 各通道 0-200 |
 | 电池限充 | ✅ 一期 | EC 0x07B9 |
-| 独显直连 Mux | ✅ 二期（实验） | DSDT IGPS/DGPS：查询可用；切换已实现但需重启，未在压力下验证 |
+| 独显直连 Mux | ✅ 二期（实验） | DSDT IGPS/DGPS：查询可用；标准/直连切换已实现但需重启，未在压力下验证；集显模式未实现 |
 | 风扇曲线 EC 侧 16 点表 | ❌ 评估后放弃 | 0x0F00-0x0F5F 需私有 WMI 命令端口写时序，读已破译写未完全破译；用户态曲线引擎已等效覆盖 |
 | 超上限 TGP（120-140W） | ⚠️ 评估结论 | CTGP/DB 偏移寄存器（0x0744/0x0746）可写但 NVML 上限稳定 115W OEM 值；与 NvpwrControl "experimental" 定位一致，遗留研究 |
 
@@ -59,9 +61,11 @@ mrvctl (CLI, 免 root)
 
 1. EC 写白名单（0x0751/0x07B9/0x0741），未知地址拒绝。
 2. 基线保存 + 位级读回验证。
-3. 风扇三层兜底：mrvd 信号处理 → systemd 重启恢复 → 内核驱动卸载钩子清 manual 位。
-4. 曲线缓降（每周期最多 -12 PWM）防转速振荡；最低运行 PWM 防停转。
-5. Mux 切换命令需 `--yes` 显式确认。
+3. `/proc/acpi/call` 串行化（线程锁 + `/run/mrvd/acpi_call.lock` flock），外部脚本也须持同一把锁。
+4. IPC 鉴权（SO_PEERCRED）：读状态任何人；写操作需 root 或 sudo/admin/wheel/mrv 组成员。
+5. INOU sysfs 开关白名单（fn_lock / super_key_enable / breathing_in_suspend / touchpad_toggle_enable）。
+6. Mux 切换命令需 `--yes` 显式确认。
+7. GUI 以普通用户运行，不截屏、不写 `/tmp`。
 
 ## 二期勘察结论（供后续开发参考）
 
@@ -78,6 +82,19 @@ mrvctl (CLI, 免 root)
 - ~~Mux 切换~~ ✅ 命令实现（切换需重启，实测风险自担）
 - 超上限 TGP：遗留研究（需 EC/NVPCF 联合调参，暂无安全路径）
 - acpi_call 替换为自研内核模块：待做（当前通道稳定，优先级降低）
+
+## v3.1.1 变更（2026-09-25，重构阶段 0：止血）
+
+- 修复：GUI 灯效下拉（单色/彩虹/关闭）不生效（守护进程丢弃了 effect 参数）
+- 修复：`/proc/acpi/call` 多线程并发无锁，可能读到其他线程的结果
+- 修复：风扇曲线 / 超温满速写只读 PWM 却报告成功；现在按能力停用并上报 `fan_mode: unsupported`
+- 修复：档位切换后物理键轮询再次触发联动（执行两遍）
+- 修复：状态文件并发读改写丢更新；限充读失败误显示 100%；`mrvctl status` 空值崩溃
+- 安全：IPC 鉴权；INOU 开关白名单（原先可写该目录下任意 sysfs 属性）；GUI 去掉整屏截图写 `/tmp`
+- 性能：IPC 每连接一个线程；独显休眠时不调用 nvidia-smi；功耗上限查询缓存 60 秒
+- GUI：删除重复的"离电自动关灯"开关；集显按钮禁用；无托盘时关窗即退出
+- 打包：`install.sh` 改为构建并安装 deb；升级时清理旧手工安装残留；图标打入包内；`mrvd.service` 去掉空的 ExecStopPost 和静默不启动的 Condition
+- 新增：`scripts/probe-readonly.sh` 只读探测 EC 能力位与自定义风扇表（结果见 `docs/probe/`）
 
 ## v3.1 变更（2026-09-25）
 

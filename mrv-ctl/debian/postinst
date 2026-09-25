@@ -17,11 +17,14 @@ cat > /etc/modprobe.d/mrv-uniwill.conf <<'EOF'
 # mrv-ctl: 强制在 MECHREVO 等非 TUXEDO 品牌的 Uniwill 准系统上加载
 options uniwill_laptop force=1
 EOF
-update-initramfs -u >/dev/null 2>&1 || true
+
+# 旧版 install.sh 的残留: /etc 下的同名 unit 会遮蔽包内 unit
+rm -f /etc/modules-load.d/mrv.conf /usr/local/bin/mrvctl /etc/systemd/system/mrvd.service
 
 echo "mrv-ctl: 启用守护进程..."
 systemctl daemon-reload
-systemctl enable --now mrvd.service 2>/dev/null || true
+systemctl enable mrvd.service 2>/dev/null || true
+systemctl restart mrvd.service 2>/dev/null || true
 
 echo "mrv-ctl: 修复 nvidia-powerd (Dynamic Boost, Ubuntu 打包缺失)..."
 if [ -x /usr/bin/nvidia-powerd ]; then
@@ -70,9 +73,9 @@ cat > /usr/share/applications/mrv-ctl.desktop <<'EOF'
 [Desktop Entry]
 Name=mrv-ctl 机械革命控制台
 GenericName=笔记本控制中心
-Comment=性能模式/风扇/RGB/限充/独显直连
+Comment=性能模式/RGB/限充/独显直连
 Exec=/usr/bin/mrv-gui
-Icon=preferences-system
+Icon=mrv-ctl
 Terminal=false
 Type=Application
 Categories=System;HardwareSettings;
@@ -93,4 +96,6 @@ X-GNOME-Autostart-enabled=true
 EOF
 done
 
-echo "mrv-ctl: 安装完成。重启后全部功能自动生效。"
+gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
+
+echo "mrv-ctl: 安装完成。"

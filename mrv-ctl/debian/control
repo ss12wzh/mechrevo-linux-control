@@ -1,14 +1,12 @@
 Package: mrv-ctl
-Version: 3.1.0
+Version: 3.1.1
 Section: utils
 Priority: optional
 Architecture: all
 Depends: python3 (>= 3.10), python3-gi, gir1.2-gtk-3.0, gir1.2-ayatanaappindicator3-0.1, acpi-call-dkms
-Recommends: nvidia-driver-570 | nvidia-driver-550 | nvidia-driver-595
-Suggests: nvidia-powerd
 Maintainer: mrv-ctl project <mrv-ctl@local>
 Description: 机械革命 Linux 控制台 (40/50 系游戏本)
  对标 Windows 版 L-Mechrevo 的开源控制台:
- 性能模式、GPU 功耗解锁(Dynamic Boost)、风扇曲线、
- 键盘 RGB、电池限充、独显直连、托盘与悬浮窗。
- 支持 Uniwill 准系统机械革命游戏本, 安装即用。
+ 性能模式、GPU 功耗解锁(Dynamic Boost)、键盘 RGB、
+ 电池限充、独显直连、托盘与悬浮窗。
+ 支持 Uniwill 准系统机械革命游戏本。

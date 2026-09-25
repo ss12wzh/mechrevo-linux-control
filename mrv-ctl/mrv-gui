@@ -12,14 +12,13 @@ mrv-gui — 机械革命 Linux 控制台 (v3.1, 视觉对标 L-Mechrevo Windows 
 """
 
 import json
+import os
 import socket
-import sys
 import threading
 
 import gi
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, Gdk, GLib, GdkPixbuf, Pango
-from PIL import Image, ImageFilter
+from gi.repository import Gtk, Gdk, GLib, Pango
 
 try:
     gi.require_version("AyatanaAppIndicator3", "0.1")
@@ -31,7 +30,7 @@ except (ValueError, ImportError):
 SOCK_PATH = "/run/mrvd/mrvd.sock"
 def log_gui(m):
     print(f"[gui] {m}")
-VERSION = "3.1.0"
+VERSION = "3.1.1"
 ICON_PATH = "/usr/share/icons/hicolor/256x256/apps/mrv-ctl.png"
 
 # ============================================================ 视觉主题
@@ -41,14 +40,10 @@ CSS_TEXT = """
    蓝紫渐变背景 + 半透明玻璃卡片 + 超大号数值 + 胶囊分段控件   */
 
 window { background: transparent; }
-.glass { background-image: url('/tmp/mrv-gui-bg.png'); background-size: cover; }
 
-/* 半透明蒙层: 让模糊底图压暗并染上蓝紫调, 形成毛玻璃观感 */
+/* 半透明蓝紫渐变: 有合成器时透出桌面, 无合成器时退化为纯色渐变 */
 .bg {
-  background-image:
-    linear-gradient(163deg, rgba(26,30,40,0.46), rgba(16,18,26,0.58)),
-    url('/tmp/mrv-gui-bg.png');
-  background-size: cover, cover;
+  background-image: linear-gradient(163deg, rgba(40,48,84,0.90), rgba(18,20,32,0.94));
 }
 
 .titlebar { padding: 16px 20px 2px 20px; background: transparent; }
@@ -135,9 +130,11 @@ def call(cmd, timeout=8.0):
         s.settimeout(timeout)
         s.connect(SOCK_PATH)
         s.sendall(json.dumps(cmd).encode())
-        resp = json.loads(s.recv(131072).decode())
+        buf = b""
+        while chunk := s.recv(65536):
+            buf += chunk
         s.close()
-        return resp
+        return json.loads(buf.decode())
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -153,10 +150,12 @@ class FloatWin(Gtk.Window):
         self.set_decorated(False)
         self.set_resizable(False)
         self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
-        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_MOTION_MASK)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
+                        | Gdk.EventMask.BUTTON_MOTION_MASK)
         self.connect("button-press-event", self._press)
-        self.connect("motion-notify-event", self._drag)
-        self._drag = None
+        self.connect("button-release-event", self._release)
+        self.connect("motion-notify-event", self._motion)
+        self._drag_origin = None
         outer = Gtk.Box()
         outer.get_style_context().add_class("floatwin")
         inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -169,11 +168,14 @@ class FloatWin(Gtk.Window):
         self.add(outer)
 
     def _press(self, w, e):
-        self._drag = (e.x_root, e.y_root, self.get_position())
+        self._drag_origin = (e.x_root, e.y_root, self.get_position())
 
-    def _drag(self, w, e):
-        if self._drag:
-            x0, y0, (wx, wy) = self._drag
+    def _release(self, w, e):
+        self._drag_origin = None
+
+    def _motion(self, w, e):
+        if self._drag_origin:
+            x0, y0, (wx, wy) = self._drag_origin
             self.move(int(wx + e.x_root - x0), int(wy + e.y_root - y0))
 
     def update(self, st):
@@ -181,7 +183,7 @@ class FloatWin(Gtk.Window):
         g = st.get("gpu", {})
         f1 = st.get("fan1_rpm")
         t = f"CPU {cpu:.0f}°  GPU {gpu:.0f}°" if cpu is not None and gpu is not None else ""
-        p = f"GPU {g['draw_w']:.0f}W / {g.get('current_limit_w', 0):.0f}W" if g.get("draw_w") is not None else ""
+        p = f"GPU {g['draw_w']:.0f}W / {g.get('current_limit_w') or 0:.0f}W" if g.get("draw_w") is not None else ""
         f = f"风扇 {f1} RPM" if f1 else ""
         self.lbl.set_text("\n".join(x for x in (t, p, f) if x))
 
@@ -199,16 +201,14 @@ class MrvGUI:
         self.win.set_default_size(460, 780)
         self.win.set_resizable(True)
         self.win.set_position(Gtk.WindowPosition.CENTER)
-        if ICON_PATH and __import__("os").path.exists(ICON_PATH):
+        if os.path.exists(ICON_PATH):
             try:
                 self.win.set_icon_from_file(ICON_PATH)
             except Exception:
                 pass
         self.win.connect("destroy", self.on_quit)
 
-        # 毛玻璃: RGBA 视觉 + 抓屏模糊底图
         self._enable_rgba()
-        self._blur_bg()
 
         # 深色主题 (匹配 token-monitor 设计语言)
         try:
@@ -393,7 +393,7 @@ class MrvGUI:
         mv.set_margin_top(10)
         self.switches = {}
         for name, label in (("fn_lock", "Fn 锁定"), ("super_key_enable", "超级键"),
-                            ("breathing_in_suspend", "睡眠呼吸灯"), ("ac_led", "离电自动关灯")):
+                            ("breathing_in_suspend", "睡眠呼吸灯")):
             row = Gtk.Box(spacing=10)
             lb = Gtk.Label(label=label, xalign=0)
             lb.get_style_context().add_class("row-label")
@@ -464,26 +464,6 @@ class MrvGUI:
         if visual:
             self.win.set_visual(visual)
         self.win.set_app_paintable(True)
-
-    def _blur_bg(self):
-        """抓取桌面 -> 高斯模糊 -> 作为窗口背景图 (真毛玻璃)"""
-        try:
-            root = Gdk.get_default_root_window()
-            w, h = root.get_width(), root.get_height()
-            pb = Gdk.pixbuf_get_from_window(root, 0, 0, w, h)
-            if pb is None:
-                return
-            tmp = "/tmp/mrv-bg-raw.png"
-            pb.savev(tmp, "png", [], [])
-            im = Image.open(tmp).convert("RGB")
-            if im.width > 1280:                       # 降采样加速模糊
-                r = 1280 / im.width
-                im = im.resize((1280, int(im.height * r)), Image.BILINEAR)
-            im = im.filter(ImageFilter.GaussianBlur(26))
-            im = Image.blend(im, Image.new("RGB", im.size, (26, 28, 36)), 0.26)
-            im.save("/tmp/mrv-gui-bg.png")
-        except Exception as e:
-            log_gui(f"毛玻璃背景失败: {e}")
 
     def _pango(self, widget, size=None, weight=None, spacing=None):
         """GTK3 无 CSS letter-spacing, 用 Pango 属性设置字间距/字重"""
@@ -559,9 +539,9 @@ class MrvGUI:
         if f:
             self.feats = f
             self.title_lbl.set_text(f"mrv-ctl  ·  {f.get('product', '')}")
-            if not f.get("mux"):
-                for b in self.mux_btns.values():
-                    b.set_sensitive(False)
+            for key, b in self.mux_btns.items():
+                b.set_sensitive(bool(f.get("mux")) and key != "igpu")
+            self.mux_btns["igpu"].set_tooltip_text("集显模式本机尚未实现")
             if not f.get("rgb"):
                 self.kbd_sw.set_sensitive(False)
         self._suppress = True
@@ -595,10 +575,11 @@ class MrvGUI:
         draw = g.get("draw_w")
         if draw is not None:
             self.big_val.set_text(f"{draw:.1f}")
-            self.limit_lbl.set_text(f"上限 {g.get('current_limit_w', 0):.0f} / 最大 {g.get('max_limit_w', 0):.0f} W")
+            cur_l, max_l = g.get("current_limit_w"), g.get("max_limit_w")
+            self.limit_lbl.set_text(f"上限 {cur_l or 0:.0f} / 最大 {max_l or 0:.0f} W")
         else:
             self.big_val.set_text("--")
-            self.limit_lbl.set_text("nvidia-smi 不可用")
+            self.limit_lbl.set_text("独显休眠中" if g.get("suspended") else "nvidia-smi 不可用")
         parts = []
         if cpu is not None:
             parts.append(f"CPU {cpu:.0f}°")
@@ -613,34 +594,24 @@ class MrvGUI:
         cyc, cap = b.get("cycles"), b.get("capacity_pct")
         ac = "⚡" if b.get("ac_online") else ""
         self.batt_lbl.set_text(f"循环 {cyc} 次 · {cap}% {ac}" if cap is not None else "")
-        self.charge_scale.set_value(st.get("charge_limit_pct") or 100)
+        if st.get("charge_limit_pct") is not None:
+            self.charge_scale.set_value(st["charge_limit_pct"])
         # 灯光摘要
         ch_on = 1 if st.get("kbd_rainbow") else (1 if (st.get("kbd_brightness") or "0") != "0" else 0)
         self.led_lbl.set_text(f"2 通道 · {ch_on} 开启")
         self.kbd_sw.set_active(bool(ch_on))
         self.effect_combo.set_active(1 if st.get("kbd_rainbow") else 0)
         self.ac_led_sw.set_active(st.get("ac_led_off", False))
-        # 更多开关
-        if f.get("fn_lock"):
-            self._sync_switch("fn_lock")
-        if f.get("super_key"):
-            self._sync_switch("super_key_enable")
-        if f.get("breathing"):
-            self._sync_switch("breathing_in_suspend")
+        toggles = st.get("toggles", {})
+        for name, sw in self.switches.items():
+            sw.set_sensitive(name in toggles)
+            sw.set_active(toggles.get(name, False))
         on_cnt = sum(1 for s in self.switches.values() if s.get_active())
         self.more_lbl.set_text(f"{on_cnt}/{len(self.switches)} 开启")
         self._suppress = False
         if self.float_visible:
             self.floatwin.update(st)
         return False
-
-    def _sync_switch(self, name):
-        try:
-            with open(f"/sys/devices/platform/INOU0000:00/{name}") as fp:
-                val = fp.read().strip() == "1"
-            self.switches.get(name).set_active(val)
-        except OSError:
-            pass
 
     def _async(self, cmd):
         threading.Thread(target=lambda: call(cmd), daemon=True).start()
@@ -734,6 +705,8 @@ class MrvGUI:
             self.win.show_all()
 
     def on_delete(self, w, e):
+        if not self.tray:
+            return False
         self.win.hide()
         return True
 

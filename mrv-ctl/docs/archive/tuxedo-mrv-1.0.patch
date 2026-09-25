@@ -1,0 +1,700 @@
+diff -ru tuxedo-drivers-4.22.3/clevo_acpi.c tuxedo-mrv-1.0/clevo_acpi.c
+--- tuxedo-drivers-4.22.3/clevo_acpi.c	2026-02-06 18:42:32.000000000 +0800
++++ tuxedo-mrv-1.0/clevo_acpi.c	2026-09-25 02:27:19.682761785 +0800
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0+
+ /*!
+- * Copyright (c) 2020 TUXEDO Computers GmbH <tux@tuxedocomputers.com>
++ * Copyright (c) 2020-2026 TUXEDO Computers GmbH <tux@tuxedocomputers.com>
+  *
+  * This file is part of tuxedo-drivers.
+  *
+@@ -21,18 +21,19 @@
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ #include <linux/kernel.h>
+ #include <linux/module.h>
++#include <linux/platform_device.h>
+ #include <linux/acpi.h>
+ #include <linux/version.h>
+ #include "clevo_interfaces.h"
+ 
+ #define DRIVER_NAME			"clevo_acpi"
+ 
+-struct clevo_acpi_driver_data_t {
++struct clevo_platform_driver_data_t {
+ 	struct acpi_device *adev;
+ 	struct clevo_interface_t *clevo_interface;
+ };
+ 
+-static struct clevo_acpi_driver_data_t *active_driver_data = NULL;
++static struct clevo_platform_driver_data_t *active_driver_data = NULL;
+ 
+ static int clevo_acpi_evaluate(struct acpi_device *device, u8 cmd, u32 arg, union acpi_object **result)
+ {
+@@ -164,15 +165,53 @@
+ 	.method_call_pkgbuf = clevo_acpi_interface_method_call_pkgbuf,
+ };
+ 
+-static int clevo_acpi_add(struct acpi_device *device)
++static void clevo_acpi_notify(acpi_handle handle, u32 event, void *data)
+ {
+-	struct clevo_acpi_driver_data_t *driver_data;
++	struct acpi_device *adev = data;
++	u32 event_value;
++	union acpi_object *out_obj;
++	int status;
++
++	// struct clevo_acpi_driver_data_t *clevo_acpi_driver_data;
++
++	status = clevo_acpi_evaluate(adev, 0x01, 0, &out_obj);
++	if (!status) {
++			if (out_obj->type == ACPI_TYPE_INTEGER) {
++				event_value = (u32)out_obj->integer.value;
++			} else {
++				pr_err("return type not integer, use clevo_evaluate_method2\n");
++			}
++			ACPI_FREE(out_obj);
++	}
++	pr_debug("clevo_acpi event: %0#6x, clevo event value: %0#6x\n", event, event_value);
+ 
+-	driver_data = devm_kzalloc(&device->dev, sizeof(*driver_data), GFP_KERNEL);
++	// clevo_acpi_driver_data = container_of(&device, struct clevo_acpi_driver_data_t, adev);
++	if (!IS_ERR_OR_NULL(clevo_acpi_interface.event_callb)) {
++		// Execute registered callback
++		clevo_acpi_interface.event_callb(event);
++	}
++}
++
++
++static int clevo_platform_probe(struct platform_device *pdev)
++{
++	struct clevo_platform_driver_data_t *driver_data;
++	struct acpi_device *acpi;
++	int error;
++
++	acpi = ACPI_COMPANION(&pdev->dev);
++	if (!acpi)
++		return -ENODEV;
++
++	error = acpi_dev_install_notify_handler(acpi, ACPI_ALL_NOTIFY, clevo_acpi_notify, acpi);
++	if (error)
++		return error;
++
++	driver_data = devm_kzalloc(&pdev->dev, sizeof(*driver_data), GFP_KERNEL);
+ 	if (!driver_data)
+ 		return -ENOMEM;
+ 
+-	driver_data->adev = device;
++	driver_data->adev = acpi;
+ 	driver_data->clevo_interface = &clevo_acpi_interface;
+ 
+ 	active_driver_data = driver_data;
+@@ -187,46 +226,26 @@
+ 	return 0;
+ }
+ 
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 2, 0)
+-static int clevo_acpi_remove(struct acpi_device *device)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
++static int clevo_acpi_remove(struct platform_device *pdev)
+ #else
+-static void clevo_acpi_remove(struct acpi_device *device)
++static void clevo_acpi_remove(struct platform_device *pdev)
+ #endif
+ {
++	struct acpi_device *acpi;
++
++	acpi = ACPI_COMPANION(&pdev->dev);
++	acpi_dev_remove_notify_handler(acpi, ACPI_ALL_NOTIFY, clevo_acpi_notify);
++
+ 	pr_debug("clevo_acpi driver remove\n");
+ 	clevo_keyboard_remove_interface(&clevo_acpi_interface);
+ 	active_driver_data = NULL;
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 2, 0)
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
+ 	return 0;
+ #endif
+ }
+ 
+-static void clevo_acpi_notify(struct acpi_device *device, u32 event)
+-{
+-	u32 event_value;
+-	union acpi_object *out_obj;
+-	int status;
+-	// struct clevo_acpi_driver_data_t *clevo_acpi_driver_data;
+-
+-	status = clevo_acpi_evaluate(device, 0x01, 0, &out_obj);
+-	if (!status) {
+-			if (out_obj->type == ACPI_TYPE_INTEGER) {
+-				event_value = (u32)out_obj->integer.value;
+-			} else {
+-				pr_err("return type not integer, use clevo_evaluate_method2\n");
+-			}
+-			ACPI_FREE(out_obj);
+-	}
+-	pr_debug("clevo_acpi event: %0#6x, clevo event value: %0#6x\n", event, event_value);
+-
+-	// clevo_acpi_driver_data = container_of(&device, struct clevo_acpi_driver_data_t, adev);
+-	if (!IS_ERR_OR_NULL(clevo_acpi_interface.event_callb)) {
+-		// Execute registered callback
+-		clevo_acpi_interface.event_callb(event);
+-	}
+-}
+-
+-#ifdef CONFIG_PM
+ static int driver_suspend_callb(struct device *dev)
+ {
+ 	pr_debug("driver suspend\n");
+@@ -239,33 +258,24 @@
+ 	return 0;
+ }
+ 
+-static SIMPLE_DEV_PM_OPS(clevo_driver_pm_ops, driver_suspend_callb, driver_resume_callb);
+-#endif
++static DEFINE_SIMPLE_DEV_PM_OPS(clevo_driver_pm_ops, driver_suspend_callb, driver_resume_callb);
+ 
+ static const struct acpi_device_id clevo_acpi_device_ids[] = {
+ 	{CLEVO_ACPI_RESOURCE_HID, 0},
+ 	{"", 0}
+ };
+ 
+-static struct acpi_driver clevo_acpi_driver = {
+-	.name = DRIVER_NAME,
+-	.class = DRIVER_NAME,
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 10, 0)
+-	.owner = THIS_MODULE,
+-#endif
+-	.ids = clevo_acpi_device_ids,
+-	.flags = ACPI_DRIVER_ALL_NOTIFY_EVENTS,
+-	.ops = {
+-		.add = clevo_acpi_add,
+-		.remove = clevo_acpi_remove,
+-		.notify = clevo_acpi_notify,
++static struct platform_driver clevo_platform_driver = {
++	.driver = {
++		.name = DRIVER_NAME,
++		.acpi_match_table = clevo_acpi_device_ids,
++		.pm = pm_ptr(&clevo_driver_pm_ops),
+ 	},
+-#ifdef CONFIG_PM
+-	.drv.pm = &clevo_driver_pm_ops
+-#endif
++	.probe = clevo_platform_probe,
++	.remove = clevo_acpi_remove,
+ };
+ 
+-module_acpi_driver(clevo_acpi_driver);
++module_platform_driver(clevo_platform_driver);
+ 
+ MODULE_AUTHOR("TUXEDO Computers GmbH <tux@tuxedocomputers.com>");
+ MODULE_DESCRIPTION("Driver for Clevo ACPI interface");
+diff -ru tuxedo-drivers-4.22.3/dkms.conf tuxedo-mrv-1.0/dkms.conf
+--- tuxedo-drivers-4.22.3/dkms.conf	2026-06-18 00:37:00.000000000 +0800
++++ tuxedo-mrv-1.0/dkms.conf	2026-09-25 02:28:12.719197964 +0800
+@@ -1,81 +1,23 @@
+-PACKAGE_NAME="tuxedo-drivers"
+-PACKAGE_VERSION="4.22.3"
++PACKAGE_NAME="tuxedo-mrv"
++PACKAGE_VERSION="1.0"
+ AUTOINSTALL="yes"
+ 
+-DEST_MODULE_LOCATION[0]="/kernel/lib/"
+-BUILT_MODULE_NAME[0]="clevo_acpi"
+-DEST_MODULE_LOCATION[1]="/kernel/lib/"
+-BUILT_MODULE_NAME[1]="clevo_wmi"
+-DEST_MODULE_LOCATION[2]="/kernel/lib/"
+-BUILT_MODULE_NAME[2]="tuxedo_keyboard"
+-DEST_MODULE_LOCATION[3]="/kernel/lib/"
+-BUILT_MODULE_NAME[3]="uniwill_wmi"
+-DEST_MODULE_LOCATION[4]="/kernel/lib/"
+-BUILT_MODULE_NAME[4]="ite_8291"
+-BUILT_MODULE_LOCATION[4]="ite_8291/"
+-DEST_MODULE_LOCATION[5]="/kernel/lib/"
+-BUILT_MODULE_NAME[5]="ite_8291_lb"
+-BUILT_MODULE_LOCATION[5]="ite_8291_lb/"
+-DEST_MODULE_LOCATION[6]="/kernel/lib/"
+-BUILT_MODULE_NAME[6]="ite_8297"
+-BUILT_MODULE_LOCATION[6]="ite_8297/"
+-DEST_MODULE_LOCATION[7]="/kernel/lib/"
+-BUILT_MODULE_NAME[7]="ite_829x"
+-BUILT_MODULE_LOCATION[7]="ite_829x/"
+-DEST_MODULE_LOCATION[8]="/kernel/lib/"
+-BUILT_MODULE_NAME[8]="tuxedo_io"
+-BUILT_MODULE_LOCATION[8]="tuxedo_io"
+-DEST_MODULE_LOCATION[9]="/kernel/lib/"
+-BUILT_MODULE_NAME[9]="tuxedo_compatibility_check"
+-BUILT_MODULE_LOCATION[9]="tuxedo_compatibility_check"
+-DEST_MODULE_LOCATION[10]="/kernel/lib/"
+-BUILT_MODULE_NAME[10]="tuxedo_nb05_keyboard"
+-BUILT_MODULE_LOCATION[10]="tuxedo_nb05"
+-DEST_MODULE_LOCATION[11]="/kernel/lib/"
+-BUILT_MODULE_NAME[11]="tuxedo_nb05_power_profiles"
+-BUILT_MODULE_LOCATION[11]="tuxedo_nb05"
+-DEST_MODULE_LOCATION[12]="/kernel/lib/"
+-BUILT_MODULE_NAME[12]="tuxedo_nb05_ec"
+-BUILT_MODULE_LOCATION[12]="tuxedo_nb05"
+-DEST_MODULE_LOCATION[13]="/kernel/lib/"
+-BUILT_MODULE_NAME[13]="tuxedo_nb05_sensors"
+-BUILT_MODULE_LOCATION[13]="tuxedo_nb05"
+-DEST_MODULE_LOCATION[14]="/kernel/lib/"
+-BUILT_MODULE_NAME[14]="tuxedo_nb04_keyboard"
+-BUILT_MODULE_LOCATION[14]="tuxedo_nb04"
+-DEST_MODULE_LOCATION[15]="/kernel/lib/"
+-BUILT_MODULE_NAME[15]="tuxedo_nb04_wmi_ab"
+-BUILT_MODULE_LOCATION[15]="tuxedo_nb04"
+-DEST_MODULE_LOCATION[16]="/kernel/lib/"
+-BUILT_MODULE_NAME[16]="tuxedo_nb04_wmi_bs"
+-BUILT_MODULE_LOCATION[16]="tuxedo_nb04"
+-DEST_MODULE_LOCATION[17]="/kernel/lib/"
+-BUILT_MODULE_NAME[17]="tuxedo_nb04_sensors"
+-BUILT_MODULE_LOCATION[17]="tuxedo_nb04"
+-DEST_MODULE_LOCATION[18]="/kernel/lib/"
+-BUILT_MODULE_NAME[18]="tuxedo_nb04_power_profiles"
+-BUILT_MODULE_LOCATION[18]="tuxedo_nb04"
+-DEST_MODULE_LOCATION[19]="/kernel/lib/"
+-BUILT_MODULE_NAME[19]="tuxedo_nb04_kbd_backlight"
+-BUILT_MODULE_LOCATION[19]="tuxedo_nb04"
+-DEST_MODULE_LOCATION[20]="/kernel/lib/"
+-BUILT_MODULE_NAME[20]="tuxedo_nb05_kbd_backlight"
+-BUILT_MODULE_LOCATION[20]="tuxedo_nb05"
+-DEST_MODULE_LOCATION[21]="/kernel/lib/"
+-BUILT_MODULE_NAME[21]="tuxedo_nb02_nvidia_power_ctrl"
+-BUILT_MODULE_LOCATION[21]="tuxedo_nb02_nvidia_power_ctrl"
+-DEST_MODULE_LOCATION[22]="/kernel/lib/"
+-BUILT_MODULE_NAME[22]="tuxedo_nb05_fan_control"
+-BUILT_MODULE_LOCATION[22]="tuxedo_nb05"
+-DEST_MODULE_LOCATION[23]="/kernel/lib/"
+-BUILT_MODULE_NAME[23]="tuxi_acpi"
+-BUILT_MODULE_LOCATION[23]="tuxedo_tuxi"
+-DEST_MODULE_LOCATION[24]="/kernel/lib/"
+-BUILT_MODULE_NAME[24]="tuxedo_tuxi_fan_control"
+-BUILT_MODULE_LOCATION[24]="tuxedo_tuxi"
+-DEST_MODULE_LOCATION[25]="/kernel/lib/"
+-BUILT_MODULE_NAME[25]="stk8321"
+-BUILT_MODULE_LOCATION[25]="stk8321"
+-DEST_MODULE_LOCATION[26]="/kernel/lib/"
+-BUILT_MODULE_NAME[26]="gxtp7380"
+-BUILT_MODULE_LOCATION[26]="gxtp7380"
++# 仅编译 mrv-ctl 需要的模块 (Uniwill EC 通道 + ioctl 接口)
++MAKE[0]="make -C ${kernel_source_dir} M=${dkms_tree}/${PACKAGE_NAME}/${PACKAGE_VERSION}/build modules"
++CLEAN="make -C ${kernel_source_dir} M=${dkms_tree}/${PACKAGE_NAME}/${PACKAGE_VERSION}/build clean"
++
++BUILT_MODULE_NAME[0]="tuxedo_compatibility_check"
++BUILT_MODULE_LOCATION[0]="tuxedo_compatibility_check"
++DEST_MODULE_LOCATION[0]="/updates/dkms"
++
++BUILT_MODULE_NAME[1]="tuxedo_keyboard"
++BUILT_MODULE_LOCATION[1]="."
++DEST_MODULE_LOCATION[1]="/updates/dkms"
++
++BUILT_MODULE_NAME[2]="uniwill_wmi"
++BUILT_MODULE_LOCATION[2]="."
++DEST_MODULE_LOCATION[2]="/updates/dkms"
++
++BUILT_MODULE_NAME[3]="tuxedo_io"
++BUILT_MODULE_LOCATION[3]="tuxedo_io"
++DEST_MODULE_LOCATION[3]="/updates/dkms"
+diff -ru tuxedo-drivers-4.22.3/gxtp7380/gxtp7380.c tuxedo-mrv-1.0/gxtp7380/gxtp7380.c
+--- tuxedo-drivers-4.22.3/gxtp7380/gxtp7380.c	2026-02-06 18:42:32.000000000 +0800
++++ tuxedo-mrv-1.0/gxtp7380/gxtp7380.c	2026-09-25 02:27:19.683096911 +0800
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0+
+ /*!
+- * Copyright (c) 2024 TUXEDO Computers GmbH <tux@tuxedocomputers.com>
++ * Copyright (c) 2024-2026 TUXEDO Computers GmbH <tux@tuxedocomputers.com>
+  *
+  * This file is part of tuxedo-drivers.
+  *
+@@ -18,58 +18,113 @@
+  * with this program; if not, see <https://www.gnu.org/licenses/>.
+  */
+ 
+-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ #include <linux/kernel.h>
++#include <linux/platform_device.h>
+ #include <linux/module.h>
+-#include <linux/acpi.h>
+ #include <linux/version.h>
++#include <linux/acpi.h>
+ 
+ #define DRIVER_NAME "gxtp7380"
+ 
+-static int gxtp7380_add(struct acpi_device *device)
++static void gxtp7380_notify(acpi_handle handle, u32 event, void *data)
+ {
+-	kobject_uevent(&device->dev.kobj, KOBJ_ADD);
++	struct acpi_device *acpi = data;
++	kobject_uevent(&acpi->dev.kobj, KOBJ_CHANGE);
++}
++
++static int gxtp7380_probe(struct platform_device *pdev)
++{
++	struct acpi_device *acpi;
++	int error;
++
++	acpi = ACPI_COMPANION(&pdev->dev);
++	if (!acpi)
++		return -ENODEV;
++
++	error = acpi_dev_install_notify_handler(acpi, ACPI_ALL_NOTIFY, gxtp7380_notify, acpi);
++	if (error)
++		return error;
++
++	kobject_uevent(&pdev->dev.kobj, KOBJ_ADD);
+ 	return 0;
+ }
+ 
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 2, 0)
+-static int gxtp7380_remove(struct acpi_device *device)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
++static int gxtp7380_remove(struct platform_device *pdev)
+ #else
+-static void gxtp7380_remove(struct acpi_device *device)
++static void gxtp7380_remove(struct platform_device *pdev)
+ #endif
+ {
+-	kobject_uevent(&device->dev.kobj, KOBJ_REMOVE);
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 2, 0)
++	struct acpi_device *acpi;
++
++	acpi = ACPI_COMPANION(&pdev->dev);
++	acpi_dev_remove_notify_handler(acpi, ACPI_ALL_NOTIFY, gxtp7380_notify);
++
++	kobject_uevent(&pdev->dev.kobj, KOBJ_REMOVE);
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
+ 	return 0;
+ #endif
+ }
+ 
+-static void gxtp7380_notify(struct acpi_device *device, u32 event)
+-{
+-	kobject_uevent(&device->dev.kobj, KOBJ_CHANGE);
+-}
+-
+ static const struct acpi_device_id gxtp7380_device_ids[] = {
+ 	{ "GXTP7380", 0 },
+ 	{ "", 0 }
+ };
++MODULE_DEVICE_TABLE(acpi, gxtp7380_device_ids);
+ 
+-static struct acpi_driver gxtp7380_driver = {
+-	.name = DRIVER_NAME,
+-	.class = DRIVER_NAME,
+-	.ids = gxtp7380_device_ids,
+-	.flags = ACPI_DRIVER_ALL_NOTIFY_EVENTS,
+-	.ops = {
+-		.add = gxtp7380_add,
+-		.remove = gxtp7380_remove,
+-		.notify = gxtp7380_notify,
++static struct platform_driver gxtp7380_driver = {
++	.driver = {
++		.name = DRIVER_NAME,
++		.acpi_match_table = gxtp7380_device_ids,
+ 	},
++	.probe = gxtp7380_probe,
++	.remove = gxtp7380_remove,
+ };
+ 
+-module_acpi_driver(gxtp7380_driver);
++static struct platform_device *pdev;
++
++static int __init gxtp7380_driver_init(void)
++{
++	struct acpi_device *acpi;
++	struct platform_device_info pdevinfo = {0};
++	int ret;
++
++	acpi = acpi_dev_get_first_match_dev("GXTP7380", NULL, -1);
++	if (!acpi)
++		return -ENODEV;
++
++	pdevinfo.name   = DRIVER_NAME;
++        pdevinfo.id     = PLATFORM_DEVID_NONE;
++        pdevinfo.fwnode = acpi_fwnode_handle(acpi);
++
++	pdev = platform_device_register_full(&pdevinfo);
++	if (IS_ERR(pdev))
++		return PTR_ERR(pdev);
++
++	ret = platform_driver_register(&gxtp7380_driver);
++	if (ret) {
++		platform_device_unregister(pdev);
++		pdev = NULL;
++		return ret;
++	}
++
++	return 0;
++}
++
++static void __exit gxtp7380_driver_exit(void)
++{
++	platform_driver_unregister(&gxtp7380_driver);
++
++	if (pdev)
++		platform_device_unregister(pdev);
++
++	pdev = NULL;
++}
++
++module_init(gxtp7380_driver_init);
++module_exit(gxtp7380_driver_exit);
+ 
+ MODULE_AUTHOR("TUXEDO Computers GmbH <tux@tuxedocomputers.com>");
+ MODULE_DESCRIPTION("Touch panel disable, notify driver");
+ MODULE_LICENSE("GPL");
+-
+-MODULE_DEVICE_TABLE(acpi, gxtp7380_device_ids);
+diff -ru tuxedo-drivers-4.22.3/Kbuild tuxedo-mrv-1.0/Kbuild
+--- tuxedo-drivers-4.22.3/Kbuild	2026-02-06 18:42:32.000000000 +0800
++++ tuxedo-mrv-1.0/Kbuild	2026-09-25 02:28:12.717093528 +0800
+@@ -1,17 +1,4 @@
+-obj-m += clevo_acpi.o
+-obj-m += clevo_wmi.o
++obj-m += tuxedo_compatibility_check/tuxedo_compatibility_check.o
+ obj-m += tuxedo_keyboard.o
+ obj-m += uniwill_wmi.o
+-
+-obj-y += ite_8291/
+-obj-y += ite_8291_lb/
+-obj-y += ite_8297/
+-obj-y += ite_829x/
+-obj-y += tuxedo_compatibility_check/
+-obj-y += tuxedo_io/
+-obj-y += tuxedo_nb02_nvidia_power_ctrl/
+-obj-y += tuxedo_nb05/
+-obj-y += tuxedo_nb04/
+-obj-y += tuxedo_tuxi/
+-obj-y += stk8321/
+-obj-y += gxtp7380/
++obj-m += tuxedo_io/tuxedo_io.o
+diff -ru tuxedo-drivers-4.22.3/tuxedo_keyboard.c tuxedo-mrv-1.0/tuxedo_keyboard.c
+--- tuxedo-drivers-4.22.3/tuxedo_keyboard.c	2026-02-06 18:42:32.000000000 +0800
++++ tuxedo-mrv-1.0/tuxedo_keyboard.c	2026-09-25 02:27:19.684090607 +0800
+@@ -195,12 +195,20 @@
+ }
+ EXPORT_SYMBOL(tuxedo_keyboard_remove_driver);
+ 
++/* mrv-ctl patch: allow loading on non-TUXEDO Uniwill devices (e.g. MECHREVO) */
++static bool force;
++module_param(force, bool, 0644);
++MODULE_PARM_DESC(force, "Force load on unsupported (non-TUXEDO) Uniwill devices");
++
+ static int __init tuxedo_keyboard_init(void)
+ {
+ 	TUXEDO_INFO("module init\n");
+ 
+-	if (!tuxedo_is_compatible())
+-		return -ENODEV;
++	if (!tuxedo_is_compatible()) {
++		if (!force)
++			return -ENODEV;
++		pr_warn("tuxedo_keyboard: force loading on an unsupported device\n");
++	}
+ 
+ 	return 0;
+ }
+diff -ru tuxedo-drivers-4.22.3/tuxedo_tuxi/tuxi_acpi.c tuxedo-mrv-1.0/tuxedo_tuxi/tuxi_acpi.c
+--- tuxedo-drivers-4.22.3/tuxedo_tuxi/tuxi_acpi.c	2026-02-06 18:42:32.000000000 +0800
++++ tuxedo-mrv-1.0/tuxedo_tuxi/tuxi_acpi.c	2026-09-25 02:27:19.685261519 +0800
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0+
+ /*!
+- * Copyright (c) 2024 TUXEDO Computers GmbH <tux@tuxedocomputers.com>
++ * Copyright (c) 2024-2026 TUXEDO Computers GmbH <tux@tuxedocomputers.com>
+  *
+  * This file is part of tuxedo-drivers.
+  *
+@@ -21,18 +21,19 @@
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ #include <linux/kernel.h>
+ #include <linux/module.h>
++#include <linux/platform_device.h>
+ #include <linux/acpi.h>
+ #include <linux/version.h>
+ #include "tuxi_acpi.h"
+ 
+ #define DRIVER_NAME "tuxi_acpi"
+ 
+-struct tuxi_acpi_driver_data_t {
++struct tuxi_platform_driver_data_t {
+ 	struct acpi_device *tuxi_adev;
+ 	acpi_handle tfan_handle;
+ };
+ 
+-static struct tuxi_acpi_driver_data_t *tuxi_driver_data = NULL;
++static struct tuxi_platform_driver_data_t *tuxi_driver_data = NULL;
+ 
+ static
+ int evaluate_intparams(acpi_handle handle,
+@@ -285,20 +286,25 @@
+ 	return 0;
+ }
+ 
+-static int tuxi_acpi_add(struct acpi_device *device)
++static int tuxi_platform_probe(struct platform_device *pdev)
+ {
+-	struct tuxi_acpi_driver_data_t *driver_data;
++	struct tuxi_platform_driver_data_t *driver_data;
++	struct acpi_device *acpi;
+ 	int err;
+ 
+-	driver_data = devm_kzalloc(&device->dev, sizeof(*driver_data), GFP_KERNEL);
++	acpi = ACPI_COMPANION(&pdev->dev);
++	if (!acpi)
++		return -ENODEV;
++
++	driver_data = devm_kzalloc(&pdev->dev, sizeof(*driver_data), GFP_KERNEL);
+ 	if (!driver_data)
+ 		return -ENOMEM;
+ 
+-	driver_data->tuxi_adev = device;
+-	device->driver_data = driver_data;
++	driver_data->tuxi_adev = acpi;
++	acpi->driver_data = driver_data;
+ 
+ 	// Find subdevices
+-	err = get_tfan(device, &driver_data->tfan_handle);
++	err = get_tfan(acpi, &driver_data->tfan_handle);
+ 	if (err)
+ 		driver_data->tfan_handle = NULL;
+ 
+@@ -312,25 +318,20 @@
+ 	return 0;
+ }
+ 
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 2, 0)
+-static int tuxi_acpi_remove(struct acpi_device *device)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
++static int tuxi_platform_remove(struct platform_device *pdev)
+ #else
+-static void tuxi_acpi_remove(struct acpi_device *device)
++static void tuxi_platform_remove(struct platform_device *pdev)
+ #endif
+ {
+ 	tuxi_driver_data = NULL;
+ 	pr_debug("driver remove\n");
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 2, 0)
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
+ 	return 0;
+ #endif
+ }
+ 
+-static void tuxi_acpi_notify(struct acpi_device *device, u32 event)
+-{
+-	pr_debug("event: %d\n", event);
+-}
+-
+-#ifdef CONFIG_PM
+ static int driver_suspend_callb(struct device *dev)
+ {
+ 	pr_debug("driver suspend\n");
+@@ -343,33 +344,24 @@
+ 	return 0;
+ }
+ 
+-static SIMPLE_DEV_PM_OPS(tuxi_driver_pm_ops, driver_suspend_callb, driver_resume_callb);
+-#endif
++static DEFINE_SIMPLE_DEV_PM_OPS(tuxi_driver_pm_ops, driver_suspend_callb, driver_resume_callb);
+ 
+ static const struct acpi_device_id tuxi_acpi_device_ids[] = {
+ 	{ TUXI_ACPI_RESOURCE_HID, 0 },
+ 	{ "", 0 }
+ };
+ 
+-static struct acpi_driver tuxi_acpi_driver = {
+-	.name = DRIVER_NAME,
+-	.class = DRIVER_NAME,
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 10, 0)
+-	.owner = THIS_MODULE,
+-#endif
+-	.ids = tuxi_acpi_device_ids,
+-	.flags = ACPI_DRIVER_ALL_NOTIFY_EVENTS,
+-	.ops = {
+-		.add = tuxi_acpi_add,
+-		.remove = tuxi_acpi_remove,
+-		.notify = tuxi_acpi_notify,
++static struct platform_driver tuxi_platform_driver = {
++	.driver = {
++		.name = DRIVER_NAME,
++		.acpi_match_table = tuxi_acpi_device_ids,
++		.pm = pm_ptr(&tuxi_driver_pm_ops),
+ 	},
+-#ifdef CONFIG_PM
+-	.drv.pm = &tuxi_driver_pm_ops
+-#endif
++	.probe = tuxi_platform_probe,
++	.remove = tuxi_platform_remove,
+ };
+ 
+-module_acpi_driver(tuxi_acpi_driver);
++module_platform_driver(tuxi_platform_driver);
+ 
+ MODULE_AUTHOR("TUXEDO Computers GmbH <tux@tuxedocomputers.com>");
+ MODULE_DESCRIPTION("Driver for TUXEDO ACPI interface");
+diff -ru tuxedo-drivers-4.22.3/uniwill_keyboard.h tuxedo-mrv-1.0/uniwill_keyboard.h
+--- tuxedo-drivers-4.22.3/uniwill_keyboard.h	2026-04-10 03:44:09.000000000 +0800
++++ tuxedo-mrv-1.0/uniwill_keyboard.h	2026-09-25 02:27:19.685376951 +0800
+@@ -982,7 +982,14 @@
+ 		  dmi_match(DMI_BOARD_NAME, "GM5IXxA") ||
+ 
+ 		  // InfinityBook Max Gen10
+-		  dmi_match(DMI_BOARD_NAME, "X5KK45xS_X5SP45xS");
++		  dmi_match(DMI_BOARD_NAME, "X5KK45xS_X5SP45xS") ||
++		  dmi_match(DMI_BOARD_NAME, "X6KK45xU_X6SP45xU") ||
++		  dmi_match(DMI_BOARD_NAME, "X5AR45xS") ||
++		  dmi_match(DMI_BOARD_NAME, "X6AR55xU") ||
++
++		  // Stellaris Gen8
++		  dmi_match(DMI_BOARD_NAME, "XxAF5xxx") ||
++		  dmi_match(DMI_BOARD_NAME, "XxAF5xxx_mLED");
+ 
+ 	return 0;
+ }
+diff -ru tuxedo-drivers-4.22.3/uniwill_leds.h tuxedo-mrv-1.0/uniwill_leds.h
+--- tuxedo-drivers-4.22.3/uniwill_leds.h	2026-02-06 18:42:32.000000000 +0800
++++ tuxedo-mrv-1.0/uniwill_leds.h	2026-09-25 02:27:19.685454884 +0800
+@@ -22,6 +22,7 @@
+ #define UNIWILL_LEDS_H
+ 
+ #include <linux/platform_device.h>
++#include <linux/version.h>
+ 
+ typedef enum {
+ 	UNIWILL_KB_BACKLIGHT_TYPE_NONE,
+@@ -55,6 +56,7 @@
+ #define UNIWILL_KBD_BRIGHTNESS_MAX_1_ZONE_RGB		0x04
+ #define UNIWILL_KBD_BRIGHTNESS_DEFAULT_1_ZONE_RGB	0x00
+ 
++#define UNIWILL_KBD_INTENSITY_MAX_1_ZONE_RGB		0xff
+ #define UNIWILL_KBD_COLOR_DEFAULT_RED			0xff
+ #define UNIWILL_KBD_COLOR_DEFAULT_GREEN			0xff
+ #define UNIWILL_KBD_COLOR_DEFAULT_BLUE			0xff
+@@ -198,16 +200,25 @@
+ 	{
+ 		.color_index = LED_COLOR_ID_RED,
+ 		.intensity = UNIWILL_KBD_COLOR_DEFAULT_RED,
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
++		.max_intensity = UNIWILL_KBD_INTENSITY_MAX_1_ZONE_RGB,
++#endif
+ 		.channel = 0
+ 	},
+ 	{
+ 		.color_index = LED_COLOR_ID_GREEN,
+ 		.intensity = UNIWILL_KBD_COLOR_DEFAULT_GREEN,
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
++		.max_intensity = UNIWILL_KBD_INTENSITY_MAX_1_ZONE_RGB,
++#endif
+ 		.channel = 0
+ 	},
+ 	{
+ 		.color_index = LED_COLOR_ID_BLUE,
+ 		.intensity = UNIWILL_KBD_COLOR_DEFAULT_BLUE,
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
++		.max_intensity = UNIWILL_KBD_INTENSITY_MAX_1_ZONE_RGB,
++#endif
+ 		.channel = 0
+ 	}
+ };

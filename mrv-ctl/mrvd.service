@@ -1,15 +1,14 @@
 [Unit]
 Description=MechRevo Linux Console Daemon (mrvd)
-After=multi-user.target
-ConditionPathExists=/proc/acpi/call
+After=systemd-modules-load.service
 
 [Service]
 Type=simple
+# acpi_call 缺失时守护进程仍可启动 (只读功能可用, EC 功能在 status 中报告不可用)
+ExecStartPre=-/sbin/modprobe acpi_call
 ExecStart=/usr/bin/python3 /opt/mrv/mrvd.py
 Restart=always
 RestartSec=5
-# 兜底: 进程退出时恢复风扇 auto (双保险, 代码内也有信号处理)
-ExecStopPost=/bin/sh -c 'cat /sys/class/hwmon/hwmon*/pwm1 2>/dev/null >/dev/null; true'
 
 [Install]
 WantedBy=multi-user.target
