@@ -1,0 +1,6 @@
+#!/bin/bash
+set -e
+systemctl stop mrvd.service 2>/dev/null || true
+systemctl disable mrvd.service 2>/dev/null || true
+rm -f /etc/modules-load.d/mrv-ctl.conf /etc/modprobe.d/mrv-uniwill.conf
+rm -f /usr/share/applications/mrv-ctl.desktop /etc/xdg/autostart/mrv-ctl-autostart.desktop

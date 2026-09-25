@@ -1,0 +1,96 @@
+#!/bin/bash
+# mrv-ctl deb postinst — 新机安装即用
+set -e
+
+echo "mrv-ctl: 加载内核模块..."
+# acpi_call (性能模式/EC 通道) — dkms 自动编译, 首次安装可能还没就绪, 忽略失败
+modprobe acpi_call 2>/dev/null || true
+# uniwill_laptop (风扇/背光/热键) — 内核 >= 6.12 自带, 非 TUXEDO 品牌需 force
+modprobe uniwill_laptop force=1 2>/dev/null || true
+
+echo "mrv-ctl: 配置开机自动加载..."
+cat > /etc/modules-load.d/mrv-ctl.conf <<'EOF'
+acpi_call
+uniwill_laptop
+EOF
+cat > /etc/modprobe.d/mrv-uniwill.conf <<'EOF'
+# mrv-ctl: 强制在 MECHREVO 等非 TUXEDO 品牌的 Uniwill 准系统上加载
+options uniwill_laptop force=1
+EOF
+update-initramfs -u >/dev/null 2>&1 || true
+
+echo "mrv-ctl: 启用守护进程..."
+systemctl daemon-reload
+systemctl enable --now mrvd.service 2>/dev/null || true
+
+echo "mrv-ctl: 修复 nvidia-powerd (Dynamic Boost, Ubuntu 打包缺失)..."
+if [ -x /usr/bin/nvidia-powerd ]; then
+    if [ ! -f /usr/lib/systemd/system/nvidia-powerd.service ]; then
+        cat > /usr/lib/systemd/system/nvidia-powerd.service <<'EOF'
+[Unit]
+Description=NVIDIA Power Daemon (Dynamic Boost / NVPCF)
+After=multi-user.target nvidia-persistenced.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/nvidia-powerd
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+    fi
+    if [ ! -f /usr/share/dbus-1/system.d/nvidia-powerd.conf ]; then
+        cat > /usr/share/dbus-1/system.d/nvidia-powerd.conf <<'EOF'
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <policy user="root">
+    <allow own="nvidia.powerd.server"/>
+    <allow send_destination="nvidia.powerd.server"/>
+    <allow send_destination="nvidia.powerd.server" send_interface="nvidia.powerd.server"/>
+  </policy>
+  <policy context="default">
+    <allow send_destination="nvidia.powerd.server"/>
+    <allow send_destination="nvidia.powerd.server" send_interface="nvidia.powerd.server"/>
+  </policy>
+</busconfig>
+EOF
+        # 注意: 不要 restart dbus (会杀图形会话), HUP 重载即可
+        systemctl kill -s HUP dbus 2>/dev/null || true
+    fi
+    systemctl enable --now nvidia-powerd 2>/dev/null || true
+fi
+
+# 桌面入口
+if [ -d /usr/share/applications ]; then
+cat > /usr/share/applications/mrv-ctl.desktop <<'EOF'
+[Desktop Entry]
+Name=mrv-ctl 机械革命控制台
+GenericName=笔记本控制中心
+Comment=性能模式/风扇/RGB/限充/独显直连
+Exec=/usr/bin/mrv-gui
+Icon=preferences-system
+Terminal=false
+Type=Application
+Categories=System;HardwareSettings;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+EOF
+fi
+
+# 用户自启动 (托盘常驻)
+for d in /etc/xdg/autostart; do
+  [ -d "$d" ] && cat > "$d/mrv-ctl-autostart.desktop" <<'EOF'
+[Desktop Entry]
+Name=mrv-ctl 托盘
+Exec=/usr/bin/mrv-gui
+Terminal=false
+Type=Application
+X-GNOME-Autostart-enabled=true
+EOF
+done
+
+echo "mrv-ctl: 安装完成。重启后全部功能自动生效。"

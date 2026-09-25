@@ -1,0 +1,758 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+mrv-gui — 机械革命 Linux 控制台 (v3.1, 视觉对标 L-Mechrevo Windows 版)
+
+界面语言参考自 L-Mechrevo (Avalonia/C#) 深色控制台:
+  - 纯黑背景 + 深灰圆角卡片 + 蓝色高亮
+  - 分区标题带图标, 右上角状态摘要文字
+  - 分段式模式选择按钮组
+  - 底部图标工具栏
+依赖: python3-gi, gir1.2-gtk-3.0, gir1.2-ayatanaappindicator3-0.1
+"""
+
+import json
+import socket
+import sys
+import threading
+
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, Gdk, GLib, GdkPixbuf, Pango
+from PIL import Image, ImageFilter
+
+try:
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3
+    HAS_INDICATOR = True
+except (ValueError, ImportError):
+    HAS_INDICATOR = False
+
+SOCK_PATH = "/run/mrvd/mrvd.sock"
+def log_gui(m):
+    print(f"[gui] {m}")
+VERSION = "3.1.0"
+ICON_PATH = "/usr/share/icons/hicolor/256x256/apps/mrv-ctl.png"
+
+# ============================================================ 视觉主题
+# 参考 L-Mechrevo: bg #0a0a0c / card #16181d / accent #1f6feb / text #e6e8ec
+CSS_TEXT = """
+/* ===== 视觉: 参考 token-monitor 实机渲染 =====
+   蓝紫渐变背景 + 半透明玻璃卡片 + 超大号数值 + 胶囊分段控件   */
+
+window { background: transparent; }
+.glass { background-image: url('/tmp/mrv-gui-bg.png'); background-size: cover; }
+
+/* 半透明蒙层: 让模糊底图压暗并染上蓝紫调, 形成毛玻璃观感 */
+.bg {
+  background-image:
+    linear-gradient(163deg, rgba(26,30,40,0.46), rgba(16,18,26,0.58)),
+    url('/tmp/mrv-gui-bg.png');
+  background-size: cover, cover;
+}
+
+.titlebar { padding: 16px 20px 2px 20px; background: transparent; }
+.app-title { font-size: 13px; font-weight: 600; color: rgba(255,255,255,0.92); font-family: monospace; }
+
+/* 玻璃卡片 (在渐变上浮起) */
+.card {
+  background: rgba(255,255,255,0.055);
+  border: 1px solid rgba(255,255,255,0.115);
+  border-radius: 15px;
+  padding: 13px 15px;
+  box-shadow: 0 6px 18px rgba(6,10,26,0.30);
+}
+.card-title { font-size: 12px; font-weight: 600; color: rgba(255,255,255,0.90); font-family: monospace; }
+.card-title-dim { font-size: 12px; font-weight: 600; color: rgba(255,255,255,0.62); font-family: monospace; }
+.icon { font-size: 12px; color: rgba(255,255,255,0.72); }
+
+/* 标签 / 数值 层级 */
+.label-sm { font-size: 9px; color: rgba(255,255,255,0.52); font-family: monospace; }
+.hint { font-size: 9px; color: rgba(255,255,255,0.42); font-family: monospace; }
+.summary { font-size: 9px; color: rgba(255,255,255,0.58); font-family: monospace; }
+.row-label { font-size: 11px; color: rgba(255,255,255,0.80); font-family: monospace; }
+
+/* 大号数值 (视觉焦点) */
+.big-num { font-size: 30px; font-weight: 700; color: #ffffff; font-family: monospace; }
+.big-unit { font-size: 14px; font-weight: 600; color: rgba(255,255,255,0.55); font-family: monospace; margin-left: 3px; padding-bottom: 4px; }
+.mid-num { font-size: 17px; font-weight: 600; color: rgba(255,255,255,0.94); font-family: monospace; }
+.sub-num { font-size: 9px; color: rgba(255,255,255,0.45); font-family: monospace; }
+
+/* 胶囊分段控件 (白底黑字选中, 同 token-monitor) */
+.seg-box { background: rgba(0,0,0,0.22); border: 1px solid rgba(255,255,255,0.09); border-radius: 9px; padding: 3px; }
+.seg-btn {
+  background: transparent; border: none; border-radius: 7px; padding: 7px 0;
+  color: rgba(255,255,255,0.60); font-size: 11px; font-family: monospace; font-weight: 500;
+  box-shadow: none;
+}
+.seg-btn:hover { color: rgba(255,255,255,0.92); background: rgba(255,255,255,0.05); }
+.seg-btn:checked { background: rgba(255,255,255,0.94); color: #16203c; font-weight: 600; }
+.seg-btn:disabled { color: rgba(255,255,255,0.28); }
+
+/* 进度条 / 滑条 (在渐变上的暗轨道) */
+scale trough { min-height: 5px; border-radius: 3px; background: rgba(0,0,0,0.32); border: none; }
+scale highlight { background: rgba(255,255,255,0.88); border-radius: 3px; }
+scale slider { min-width: 12px; min-height: 12px; border-radius: 6px; background: #ffffff; margin: -4px 0; box-shadow: 0 1px 4px rgba(0,0,0,0.35); }
+scale value { color: rgba(255,255,255,0.72); font-size: 10px; font-family: monospace; }
+progressbar trough { min-height: 5px; border-radius: 3px; background: rgba(0,0,0,0.32); }
+progressbar progress { background: rgba(255,255,255,0.88); border-radius: 3px; }
+
+/* 开关 */
+switch { background: rgba(0,0,0,0.34); border: 1px solid rgba(255,255,255,0.12); border-radius: 11px; }
+switch:checked { background: rgba(183,234,212,0.34); border-color: rgba(183,234,212,0.75); }
+switch slider { background: rgba(255,255,255,0.80); border-radius: 9px; min-width: 18px; min-height: 18px; margin: 2px; }
+switch:checked slider { background: #b7ead4; }
+
+/* 下拉 / 按钮 */
+combobox button {
+  background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 7px; padding: 5px 9px; color: rgba(255,255,255,0.86);
+  font-size: 10px; font-family: monospace;
+}
+combobox button:hover { background: rgba(255,255,255,0.14); }
+button.tool-btn { background: transparent; border: none; padding: 5px 9px; }
+button.tool-btn:hover { background: rgba(255,255,255,0.08); border-radius: 8px; }
+button.mini {
+  background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 7px; padding: 4px 10px; color: rgba(255,255,255,0.86);
+  font-size: 10px; font-family: monospace;
+}
+button.mini:hover { background: rgba(255,255,255,0.16); }
+.tool-icon { font-size: 14px; color: rgba(255,255,255,0.66); }
+.tool-text { font-size: 9px; color: rgba(255,255,255,0.48); font-family: monospace; }
+button.tool-btn:hover .tool-icon, button.tool-btn:hover .tool-text { color: #ffffff; }
+.toolbar { background: transparent; padding: 6px 8px 10px 8px; }
+
+/* 悬浮窗 */
+.floatwin { background: rgba(28,34,60,0.82); border-radius: 14px; border: 1px solid rgba(255,255,255,0.12); }
+.float-val { font-size: 11px; color: rgba(255,255,255,0.92); font-family: monospace; }
+"""
+
+
+def call(cmd, timeout=8.0):
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(SOCK_PATH)
+        s.sendall(json.dumps(cmd).encode())
+        resp = json.loads(s.recv(131072).decode())
+        s.close()
+        return resp
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ============================================================ 悬浮窗
+class FloatWin(Gtk.Window):
+    def __init__(self):
+        super().__init__()
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_accept_focus(False)
+        self.set_decorated(False)
+        self.set_resizable(False)
+        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_MOTION_MASK)
+        self.connect("button-press-event", self._press)
+        self.connect("motion-notify-event", self._drag)
+        self._drag = None
+        outer = Gtk.Box()
+        outer.get_style_context().add_class("floatwin")
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        inner.set_margin_top(10); inner.set_margin_bottom(10)
+        inner.set_margin_start(14); inner.set_margin_end(14)
+        self.lbl = Gtk.Label(xalign=0)
+        self.lbl.get_style_context().add_class("float-val")
+        inner.pack_start(self.lbl, False, False, 0)
+        outer.add(inner)
+        self.add(outer)
+
+    def _press(self, w, e):
+        self._drag = (e.x_root, e.y_root, self.get_position())
+
+    def _drag(self, w, e):
+        if self._drag:
+            x0, y0, (wx, wy) = self._drag
+            self.move(int(wx + e.x_root - x0), int(wy + e.y_root - y0))
+
+    def update(self, st):
+        cpu, gpu = st.get("cpu_temp"), st.get("gpu_temp")
+        g = st.get("gpu", {})
+        f1 = st.get("fan1_rpm")
+        t = f"CPU {cpu:.0f}°  GPU {gpu:.0f}°" if cpu is not None and gpu is not None else ""
+        p = f"GPU {g['draw_w']:.0f}W / {g.get('current_limit_w', 0):.0f}W" if g.get("draw_w") is not None else ""
+        f = f"风扇 {f1} RPM" if f1 else ""
+        self.lbl.set_text("\n".join(x for x in (t, p, f) if x))
+
+
+# ============================================================ 主窗口
+class MrvGUI:
+    def __init__(self):
+        self.st = {}
+        self.feats = {}
+        self.updating = False
+        self._suppress = False          # UI 同步期间抑制回写 (防误触 EC)
+
+        self.win = Gtk.Window(title="mrv-ctl")
+        # 自适应屏幕工作区 (兼容 HiDPI / 小屏笔记本)
+        self.win.set_default_size(460, 780)
+        self.win.set_resizable(True)
+        self.win.set_position(Gtk.WindowPosition.CENTER)
+        if ICON_PATH and __import__("os").path.exists(ICON_PATH):
+            try:
+                self.win.set_icon_from_file(ICON_PATH)
+            except Exception:
+                pass
+        self.win.connect("destroy", self.on_quit)
+
+        # 毛玻璃: RGBA 视觉 + 抓屏模糊底图
+        self._enable_rgba()
+        self._blur_bg()
+
+        # 深色主题 (匹配 token-monitor 设计语言)
+        try:
+            Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", True)
+        except Exception:
+            pass
+        css = Gtk.CssProvider()
+        css.load_from_data(CSS_TEXT.encode("utf-8"))
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        root.get_style_context().add_class("bg")
+        self.win.get_style_context().add_class("bg")
+        self.win.add(root)
+
+        # ---------- 标题栏
+        tb = Gtk.Box()
+        tb.get_style_context().add_class("titlebar")
+        self.title_lbl = Gtk.Label(label="mrv-ctl", xalign=0)
+        self.title_lbl.get_style_context().add_class("app-title")
+        tb.pack_start(self.title_lbl, True, True, 0)
+        root.pack_start(tb, False, False, 0)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        body.set_margin_start(16); body.set_margin_end(16)
+        body.set_margin_top(6); body.set_margin_bottom(4)
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.get_style_context().add_class("bg")
+        scroll.add(body)
+        root.pack_start(scroll, True, True, 0)
+
+        # ---------- 仪表盘 (大号数值视觉焦点)
+        c0 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        c0.get_style_context().add_class("card")
+        top = Gtk.Box()
+        tl = Gtk.Label(label="GPU 功耗", xalign=0)
+        tl.get_style_context().add_class("label-sm")
+        top.pack_start(tl, False, False, 0)
+        self.limit_lbl = Gtk.Label(xalign=1)
+        self.limit_lbl.get_style_context().add_class("summary")
+        top.pack_end(self.limit_lbl, False, False, 0)
+        c0.pack_start(top, False, False, 0)
+        nrow = Gtk.Box(spacing=2)
+        self.big_val = Gtk.Label(label="--", xalign=0)
+        self.big_val.get_style_context().add_class("big-num")
+        nrow.pack_start(self.big_val, False, False, 0)
+        un = Gtk.Label(label="W", xalign=0)
+        un.get_style_context().add_class("big-unit")
+        nrow.pack_start(un, False, False, 0)
+        c0.pack_start(nrow, False, False, 0)
+        self.dash_sub = Gtk.Label(xalign=0)
+        self.dash_sub.get_style_context().add_class("label-sm")
+        c0.pack_start(self.dash_sub, False, False, 0)
+        body.pack_start(c0, False, False, 0)
+
+        # ---------- 实时监控 (CPU / GPU)
+        ct, ht = self._card("◈", "实时监控")
+        self.tm_sub = Gtk.Label(xalign=1)
+        self.tm_sub.get_style_context().add_class("summary")
+        ht.pack_end(self.tm_sub, False, False, 0)
+        grid = Gtk.Grid()
+        grid.set_row_spacing(6)
+        grid.set_column_spacing(10)
+        grid.set_margin_top(10)
+        self.tm_labels = {}
+        rows = [("CPU 频率", "cpu_freq"), ("CPU 功耗", "cpu_power"),
+                ("GPU 频率", "gpu_freq"), ("GPU 显存", "gpu_mem"),
+                ("GPU 利用率", "gpu_util")]
+        for i, (name, key) in enumerate(rows):
+            lb = Gtk.Label(label=name, xalign=0)
+            lb.get_style_context().add_class("row-label")
+            vl = Gtk.Label(label="--", xalign=1)
+            vl.get_style_context().add_class("mid-num")
+            self.tm_labels[key] = vl
+            grid.attach(lb, 0, i, 1, 1)
+            grid.attach(vl, 1, i, 1, 1)
+        ct.pack_start(grid, False, False, 0)
+        body.pack_start(ct, False, False, 0)
+
+        # ---------- 性能模式
+        c1, h1 = self._card("⚡", "性能模式")
+        self.temp_lbl = Gtk.Label(xalign=1)
+        self.temp_lbl.get_style_context().add_class("summary")
+        h1.pack_end(self.temp_lbl, False, False, 0)
+        seg = Gtk.Box(spacing=0)
+        seg.get_style_context().add_class("seg-box")
+        seg.set_margin_top(11)
+        self.profile_btns = {}
+        for key, name in (("office", "静音"), ("balanced", "平衡"), ("boost", "狂暴")):
+            b = Gtk.ToggleButton(label=name)
+            b.get_style_context().add_class("seg-btn")
+            b.connect("toggled", self.on_profile, key)
+            self.profile_btns[key] = b
+            seg.pack_start(b, True, True, 0)
+        c1.pack_start(seg, False, False, 0)
+        body.pack_start(c1, False, False, 0)
+
+        # ---------- 显卡模式
+        c2, h2 = self._card("🖥", "显卡模式")
+        hint = Gtk.Label(label="重启生效")
+        hint.get_style_context().add_class("hint")
+        h2.pack_end(hint, False, False, 0)
+        seg2 = Gtk.Box(spacing=0)
+        seg2.get_style_context().add_class("seg-box")
+        seg2.set_margin_top(11)
+        self.mux_btns = {}
+        for key, name in (("igpu", "集显"), ("standard", "标准"), ("dgpu", "直连")):
+            b = Gtk.ToggleButton(label=name)
+            b.get_style_context().add_class("seg-btn")
+            b.connect("toggled", self.on_mux, key)
+            self.mux_btns[key] = b
+            seg2.pack_start(b, True, True, 0)
+        c2.pack_start(seg2, False, False, 0)
+        body.pack_start(c2, False, False, 0)
+
+        # ---------- 电池
+        c3, h3 = self._card("🔋", "电池")
+        self.batt_lbl = Gtk.Label(xalign=1)
+        self.batt_lbl.get_style_context().add_class("summary")
+        h3.pack_end(self.batt_lbl, False, False, 0)
+        line = Gtk.Box(spacing=12)
+        line.set_margin_top(12)
+        lb = Gtk.Label(label="限充", xalign=0)
+        lb.get_style_context().add_class("row-label")
+        line.pack_start(lb, False, False, 0)
+        self.charge_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 20, 100, 5)
+        self.charge_scale.set_value(100)
+        self.charge_scale.set_draw_value(True)
+        self.charge_scale.set_value_pos(Gtk.PositionType.RIGHT)
+        self.charge_scale.connect("button-release-event", self.on_charge)
+        line.pack_start(self.charge_scale, True, True, 0)
+        c3.pack_start(line, False, False, 0)
+        body.pack_start(c3, False, False, 0)
+
+        # ---------- 灯光
+        c4, h4 = self._card("💡", "灯光")
+        self.led_lbl = Gtk.Label(xalign=1)
+        self.led_lbl.get_style_context().add_class("summary")
+        h4.pack_end(self.led_lbl, False, False, 0)
+
+        ac_row = Gtk.Box(spacing=10)
+        ac_row.set_margin_top(10)
+        self.ac_led_sw = Gtk.Switch()
+        self.ac_led_sw.connect("notify::active", self.on_ac_led)
+        ac_row.pack_start(self.ac_led_sw, False, False, 0)
+        ac_lb = Gtk.Label(label="离电自动关闭全部灯效", xalign=0)
+        ac_lb.get_style_context().add_class("row-label")
+        ac_row.pack_start(ac_lb, True, True, 0)
+        c4.pack_start(ac_row, False, False, 0)
+
+        kbd_row = Gtk.Box(spacing=10)
+        kbd_row.set_margin_top(8)
+        self.kbd_sw = Gtk.Switch()
+        self.kbd_sw.connect("notify::active", self.on_kbd_toggle)
+        kbd_row.pack_start(self.kbd_sw, False, False, 0)
+        kb_lb = Gtk.Label(label="键盘", xalign=0)
+        kb_lb.get_style_context().add_class("row-label")
+        kbd_row.pack_start(kb_lb, False, False, 0)
+        kbd_row.pack_start(Gtk.Box(), True, True, 0)
+        self.effect_combo = Gtk.ComboBoxText()
+        for name in ("单色", "流畅彩虹", "关闭"):
+            self.effect_combo.append_text(name)
+        self.effect_combo.set_active(0)
+        self.effect_combo.connect("changed", self.on_effect)
+        kbd_row.pack_start(self.effect_combo, False, False, 0)
+        color_btn = Gtk.Button(label="颜色")
+        color_btn.get_style_context().add_class("mini")
+        color_btn.connect("clicked", self.on_color)
+        kbd_row.pack_start(color_btn, False, False, 0)
+        c4.pack_start(kbd_row, False, False, 0)
+        body.pack_start(c4, False, False, 0)
+
+        # ---------- 更多开关
+        c5, h5 = self._card("⌥", "更多开关", dim=True)
+        self.more_lbl = Gtk.Label(xalign=1)
+        self.more_lbl.get_style_context().add_class("summary")
+        h5.pack_end(self.more_lbl, False, False, 0)
+        self.more_rev = Gtk.Revealer()
+        mv = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        mv.set_margin_top(10)
+        self.switches = {}
+        for name, label in (("fn_lock", "Fn 锁定"), ("super_key_enable", "超级键"),
+                            ("breathing_in_suspend", "睡眠呼吸灯"), ("ac_led", "离电自动关灯")):
+            row = Gtk.Box(spacing=10)
+            lb = Gtk.Label(label=label, xalign=0)
+            lb.get_style_context().add_class("row-label")
+            row.pack_start(lb, True, True, 0)
+            sw = Gtk.Switch()
+            sw.connect("notify::active", self.on_more_switch, name)
+            self.switches[name] = sw
+            row.pack_start(sw, False, False, 0)
+            mv.pack_start(row, False, False, 0)
+        self.more_rev.add(mv)
+        c5.pack_start(self.more_rev, False, False, 0)
+        # 点击标题展开
+        eb = Gtk.EventBox()
+        eb.add(c5)
+        c5.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        c5.connect("button-press-event", lambda w, e: self._toggle_more() if e.y < 30 else False)
+        body.pack_start(eb, False, False, 0)
+
+        # ---------- 底部工具栏
+        tools = Gtk.Box(spacing=0)
+        tools.get_style_context().add_class("toolbar")
+        lbl_ver = Gtk.Label(label=f"v{VERSION}")
+        lbl_ver.get_style_context().add_class("tool-text")
+        lbl_ver.set_margin_end(10)
+        tools.pack_start(lbl_ver, False, False, 0)
+        tools.pack_start(Gtk.Box(), True, True, 0)
+        for icon, text, cb in (("🪟", "悬浮窗", self.on_float),
+                               ("⚙", "设置", self.on_more_btn),
+                               ("⏻", "退出", self.on_quit)):
+            tools.pack_end(self._tool_btn(icon, text, cb), False, False, 0)
+        root.pack_end(tools, False, False, 0)
+
+        # ---------- 悬浮窗 / 托盘
+        self.floatwin = FloatWin()
+        self.float_visible = False
+        self.tray = None
+        if HAS_INDICATOR:
+            self.tray = AyatanaAppIndicator3.Indicator.new(
+                "mrv-ctl", "preferences-system" if not ICON_PATH else ICON_PATH,
+                AyatanaAppIndicator3.IndicatorCategory.APPLICATION_STATUS)
+            self.tray.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
+            menu = Gtk.Menu()
+            for label, cb in (("打开 mrv-ctl", self.on_toggle_win),
+                              ("性能: 静音", lambda m: self.set_profile("office")),
+                              ("性能: 平衡", lambda m: self.set_profile("balanced")),
+                              ("性能: 自定义(狂暴)", lambda m: self.set_profile("boost")),
+                              ("悬浮窗", lambda m: self.on_float(None))):
+                item = Gtk.MenuItem(label=label)
+                item.connect("activate", cb)
+                menu.append(item)
+            menu.append(Gtk.SeparatorMenuItem())
+            q = Gtk.MenuItem(label="退出")
+            q.connect("activate", self.on_quit)
+            menu.append(q)
+            menu.show_all()
+            self.tray.set_menu(menu)
+        self.win.connect("delete-event", self.on_delete)
+
+        GLib.timeout_add(2000, self.refresh)
+        self._style_text()
+        self.refresh()
+
+    # ---------------- helpers
+    def _enable_rgba(self):
+        """开启窗口 RGBA 视觉, 使背景真正透明"""
+        screen = self.win.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual:
+            self.win.set_visual(visual)
+        self.win.set_app_paintable(True)
+
+    def _blur_bg(self):
+        """抓取桌面 -> 高斯模糊 -> 作为窗口背景图 (真毛玻璃)"""
+        try:
+            root = Gdk.get_default_root_window()
+            w, h = root.get_width(), root.get_height()
+            pb = Gdk.pixbuf_get_from_window(root, 0, 0, w, h)
+            if pb is None:
+                return
+            tmp = "/tmp/mrv-bg-raw.png"
+            pb.savev(tmp, "png", [], [])
+            im = Image.open(tmp).convert("RGB")
+            if im.width > 1280:                       # 降采样加速模糊
+                r = 1280 / im.width
+                im = im.resize((1280, int(im.height * r)), Image.BILINEAR)
+            im = im.filter(ImageFilter.GaussianBlur(26))
+            im = Image.blend(im, Image.new("RGB", im.size, (26, 28, 36)), 0.26)
+            im.save("/tmp/mrv-gui-bg.png")
+        except Exception as e:
+            log_gui(f"毛玻璃背景失败: {e}")
+
+    def _pango(self, widget, size=None, weight=None, spacing=None):
+        """GTK3 无 CSS letter-spacing, 用 Pango 属性设置字间距/字重"""
+        attrs = Pango.AttrList()
+        if size:
+            attrs.insert(Pango.attr_size_new_absolute(int(size * Pango.SCALE)))
+        if weight:
+            attrs.insert(Pango.attr_weight_new(weight))
+        if spacing:
+            attrs.insert(Pango.attr_letter_spacing_new(int(spacing * Pango.SCALE)))
+        widget.set_attributes(attrs)
+        return widget
+
+    def _card(self, icon, title, dim=False):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.get_style_context().add_class("card")
+        head = Gtk.Box(spacing=8)
+        ic = Gtk.Label(label=icon)
+        ic.get_style_context().add_class("summary")
+        head.pack_start(ic, False, False, 0)
+        t = Gtk.Label(label=title, xalign=0)
+        t.get_style_context().add_class("card-title-dim" if dim else "card-title")
+        head.pack_start(t, False, False, 0)
+        box.pack_start(head, False, False, 0)
+        return box, head
+
+    def _tool_btn(self, icon, text, cb):
+        b = Gtk.Button()
+        b.get_style_context().add_class("tool-btn")
+        vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        i = Gtk.Label(label=icon)
+        i.get_style_context().add_class("tool-icon")
+        t = Gtk.Label(label=text)
+        t.get_style_context().add_class("tool-text")
+        vb.pack_start(i, False, False, 0)
+        vb.pack_start(t, False, False, 0)
+        b.add(vb)
+        b.connect("clicked", cb)
+        return b
+
+    def _toggle_more(self):
+        self.more_rev.set_reveal_child(not self.more_rev.get_reveal_child())
+        return False
+
+    def on_more_btn(self, btn):
+        self._toggle_more()
+
+    # ---------------- 数据刷新
+    def refresh(self):
+        if not self.updating:
+            self.updating = True
+            threading.Thread(target=self._refresh_thread, daemon=True).start()
+        return True
+
+    def _refresh_thread(self):
+        st = call({"op": "status"}, timeout=10)
+        GLib.idle_add(self._apply_status, st)
+
+    def _style_text(self):
+        """用 Pango 设置字间距/字重 (GTK3 CSS 不支持 letter-spacing)"""
+        self._pango(self.title_lbl, size=13, weight=Pango.Weight.SEMIBOLD, spacing=0.6)
+        for w in self.profile_btns.values():
+            self._pango(w.get_child(), size=11, weight=Pango.Weight.MEDIUM, spacing=0.4)
+        for w in self.mux_btns.values():
+            self._pango(w.get_child(), size=11, weight=Pango.Weight.MEDIUM, spacing=0.4)
+
+    def _apply_status(self, st):
+        self.updating = False
+        if not st or "profile" not in st:
+            return False
+        self.st = st
+        f = st.get("features", {})
+        if f:
+            self.feats = f
+            self.title_lbl.set_text(f"mrv-ctl  ·  {f.get('product', '')}")
+            if not f.get("mux"):
+                for b in self.mux_btns.values():
+                    b.set_sensitive(False)
+            if not f.get("rgb"):
+                self.kbd_sw.set_sensitive(False)
+        self._suppress = True
+        prof = st.get("profile")
+        for key, btn in self.profile_btns.items():
+            btn.set_active(key == prof)
+        cpu, gpu = st.get("cpu_temp"), st.get("gpu_temp")
+        self.temp_lbl.set_text({
+            "office": "省电策略", "balanced": "均衡策略", "boost": "性能策略",
+        }.get(st.get("profile"), ""))
+        # 实时监控
+        c = st.get("cpu", {})
+        self.tm_labels["cpu_freq"].set_text(
+            f"{c.get('freq_avg_mhz') or '--'} MHz" + (f" (峰值 {c['freq_max_mhz']})" if c.get("freq_max_mhz") else ""))
+        self.tm_labels["cpu_power"].set_text(
+            f"{c['power_w']} W" if c.get("power_w") is not None else "不可用")
+        g2 = st.get("gpu", {})
+        self.tm_labels["gpu_freq"].set_text(
+            f"{g2['clock_mhz']:.0f} MHz" if g2.get("clock_mhz") is not None else "--")
+        if g2.get("mem_used_mb") is not None:
+            self.tm_labels["gpu_mem"].set_text(
+                f"{g2['mem_used_mb']:.0f} / {g2['mem_total_mb']:.0f} MB")
+        else:
+            self.tm_labels["gpu_mem"].set_text("--")
+        self.tm_labels["gpu_util"].set_text(
+            f"{g2['util_pct']:.0f}%" if g2.get("util_pct") is not None else "--")
+        self.tm_sub.set_text(f"{st.get('fan1_rpm') or 0} RPM" if st.get("fan1_rpm") else "")
+
+        # 仪表盘: 大号 GPU 功耗 + 副信息
+        g = st.get("gpu", {})
+        draw = g.get("draw_w")
+        if draw is not None:
+            self.big_val.set_text(f"{draw:.1f}")
+            self.limit_lbl.set_text(f"上限 {g.get('current_limit_w', 0):.0f} / 最大 {g.get('max_limit_w', 0):.0f} W")
+        else:
+            self.big_val.set_text("--")
+            self.limit_lbl.set_text("nvidia-smi 不可用")
+        parts = []
+        if cpu is not None:
+            parts.append(f"CPU {cpu:.0f}°")
+        if gpu is not None:
+            parts.append(f"GPU {gpu:.0f}°")
+        if st.get("fan1_rpm"):
+            parts.append(f"风扇 {st['fan1_rpm']}")
+        if st.get("profile"):
+            parts.append({"office": "静音档", "balanced": "平衡档", "boost": "狂暴档"}.get(st["profile"], st["profile"]))
+        self.dash_sub.set_text("   ·   ".join(parts))
+        b = st.get("battery", {})
+        cyc, cap = b.get("cycles"), b.get("capacity_pct")
+        ac = "⚡" if b.get("ac_online") else ""
+        self.batt_lbl.set_text(f"循环 {cyc} 次 · {cap}% {ac}" if cap is not None else "")
+        self.charge_scale.set_value(st.get("charge_limit_pct") or 100)
+        # 灯光摘要
+        ch_on = 1 if st.get("kbd_rainbow") else (1 if (st.get("kbd_brightness") or "0") != "0" else 0)
+        self.led_lbl.set_text(f"2 通道 · {ch_on} 开启")
+        self.kbd_sw.set_active(bool(ch_on))
+        self.effect_combo.set_active(1 if st.get("kbd_rainbow") else 0)
+        self.ac_led_sw.set_active(st.get("ac_led_off", False))
+        # 更多开关
+        if f.get("fn_lock"):
+            self._sync_switch("fn_lock")
+        if f.get("super_key"):
+            self._sync_switch("super_key_enable")
+        if f.get("breathing"):
+            self._sync_switch("breathing_in_suspend")
+        on_cnt = sum(1 for s in self.switches.values() if s.get_active())
+        self.more_lbl.set_text(f"{on_cnt}/{len(self.switches)} 开启")
+        self._suppress = False
+        if self.float_visible:
+            self.floatwin.update(st)
+        return False
+
+    def _sync_switch(self, name):
+        try:
+            with open(f"/sys/devices/platform/INOU0000:00/{name}") as fp:
+                val = fp.read().strip() == "1"
+            self.switches.get(name).set_active(val)
+        except OSError:
+            pass
+
+    def _async(self, cmd):
+        threading.Thread(target=lambda: call(cmd), daemon=True).start()
+
+    # ---------------- 回调
+    def set_profile(self, key):
+        self._async({"op": "profile", "value": key})
+
+    def on_profile(self, btn, key):
+        if self._suppress:
+            return
+        if btn.get_active():
+            self.set_profile(key)
+
+    def on_mux(self, btn, key):
+        if self._suppress:
+            return
+        if not btn.get_active():
+            return
+        dlg = Gtk.MessageDialog(transient_for=self.win, modal=True,
+                                message_type=Gtk.MessageType.WARNING,
+                                buttons=Gtk.ButtonsType.OK_CANCEL,
+                                text=f"切换显卡模式为「{btn.get_label()}」？")
+        dlg.format_secondary_text("切换会下电/上电独显并需要重启系统生效，确定继续？")
+        resp = dlg.run()
+        dlg.destroy()
+        if resp == Gtk.ResponseType.OK:
+            self._async({"op": "mux", "value": key, "confirm": True})
+        else:
+            GLib.timeout_add(200, lambda: self._uncheck_mux(key))
+
+    def _uncheck_mux(self, key):
+        self._suppress = True
+        self.mux_btns[key].set_active(False)
+        self._suppress = False
+        return False
+
+    def on_charge(self, scale, event):
+        if self._suppress:
+            return
+        self._async({"op": "charge", "value": int(scale.get_value())})
+        return False
+
+    def on_kbd_toggle(self, sw, pspec):
+        if self._suppress:
+            return
+        self._async({"op": "kbd", "brightness": 150 if sw.get_active() else 0})
+
+    def on_effect(self, combo):
+        if self._suppress:
+            return
+        idx = combo.get_active()
+        if idx == 1:
+            self._async({"op": "kbd", "effect": "rainbow", "brightness": 150})
+        elif idx == 2:
+            self._async({"op": "kbd", "effect": "off"})
+        else:
+            self._async({"op": "kbd", "effect": "solid", "brightness": 150})
+
+    def on_color(self, btn):
+        dlg = Gtk.ColorChooserDialog(title="键盘灯颜色", transient_for=self.win)
+        if dlg.run() == Gtk.ResponseType.OK:
+            rgba = dlg.get_rgba()
+            self._async({"op": "kbd", "effect": "solid",
+                         "rgb": [int(rgba.red * 200), int(rgba.green * 200), int(rgba.blue * 200)]})
+        dlg.destroy()
+
+    def on_ac_led(self, sw, pspec):
+        if self._suppress:
+            return
+        self._async({"op": "ac_led_off", "value": sw.get_active()})
+
+    def on_more_switch(self, sw, pspec, name):
+        if self._suppress:
+            return
+        self._async({"op": "toggle", "name": name, "value": sw.get_active()})
+
+    def on_float(self, btn=None):
+        self.float_visible = not self.float_visible
+        if self.float_visible:
+            self.floatwin.show_all()
+            if self.st:
+                self.floatwin.update(self.st)
+        else:
+            self.floatwin.hide()
+
+    def on_toggle_win(self, item=None):
+        if self.win.get_visible():
+            self.win.hide()
+        else:
+            self.win.show_all()
+
+    def on_delete(self, w, e):
+        self.win.hide()
+        return True
+
+    def on_quit(self, *a):
+        try:
+            self.floatwin.close()
+        except Exception:
+            pass
+        if self.tray:
+            self.tray.set_status(AyatanaAppIndicator3.IndicatorStatus.PASSIVE)
+        Gtk.main_quit()
+
+
+def main():
+    gui = MrvGUI()
+    gui.win.show_all()
+    gui.more_rev.set_reveal_child(False)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

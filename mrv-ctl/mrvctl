@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+mrvctl — 机械革命 Linux 控制台 CLI (v2)
+
+用法:
+  mrvctl status                        整机状态
+  mrvctl profile office|balanced|boost 性能模式
+  mrvctl fan auto                      风扇交还 EC 固件曲线
+  mrvctl fan curve "40:50,55:90,65:130,75:170,85:200"
+                                       用户态风扇曲线 (温度:PWM, 线性插值+缓降)
+  mrvctl kbd <0-200>                   键盘背光亮度
+  mrvctl kbd color <R> <G> <B>         RGB 颜色 (0-200)
+  mrvctl charge <20-100>               电池限充
+  mrvctl mux query                     独显直连状态查询
+  mrvctl mux dgpu|igpu --yes           Mux 切换 (需重启生效, 谨慎)
+"""
+
+import json
+import socket
+import sys
+
+SOCK_PATH = "/run/mrvd/mrvd.sock"
+
+
+def call(cmd):
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(8)
+        s.connect(SOCK_PATH)
+        s.sendall(json.dumps(cmd).encode())
+        resp = json.loads(s.recv(65536).decode())
+        s.close()
+        return resp
+    except (FileNotFoundError, ConnectionRefusedError):
+        print("错误: mrvd 未运行 (systemctl status mrvd)", file=sys.stderr)
+        sys.exit(2)
+    except Exception as e:
+        print(f"错误: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
+def cmd_status(r):
+    print(f"性能模式   : {r.get('profile')}")
+    g = r.get("gpu", {})
+    if "draw_w" in g:
+        print(f"GPU 功耗   : {g['draw_w']:.1f} W / 当前上限 {g['current_limit_w']:.0f} W (最大 {g['max_limit_w']:.0f} W)")
+    else:
+        print(f"GPU        : {g.get('error')}")
+    print(f"CPU/GPU 温度: {r.get('cpu_temp')}°C / {r.get('gpu_temp')}°C")
+    print(f"风扇       : 主 {r.get('fan1_rpm')} RPM  副 {r.get('fan2_rpm')} RPM (pwm={r.get('pwm1')})")
+    mode = r.get("fan_mode")
+    extra = f" [{r.get('fan_curve')}]" if mode == "curve" else ""
+    guard = "  <超温接管中>" if r.get("overheat_guard") else ""
+    print(f"风扇模式   : {mode}{extra}{guard}")
+    print(f"限充阈值   : {r.get('charge_limit_pct')}%")
+    rgb, br = r.get("kbd_rgb"), r.get("kbd_brightness")
+    print(f"键盘灯     : RGB({rgb}) 亮度 {br}")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    op, rest = args[0], args[1:]
+
+    if op == "status":
+        cmd_status(call({"op": "status"}))
+    elif op == "profile":
+        if not rest:
+            sys.exit("用法: mrvctl profile office|balanced|boost")
+        r = call({"op": "profile", "value": rest[0]})
+        print("已切换: " + r["profile"] if r.get("ok") else f"失败: {r.get('error')}")
+        sys.exit(0 if r.get("ok") else 1)
+    elif op == "fan":
+        if not rest:
+            sys.exit('用法: mrvctl fan auto | fan curve "T:P,..."')
+        if rest[0] in ("auto", "off"):
+            r = call({"op": "fan", "value": "auto"})
+            print("风扇已交还 EC 固件曲线" if r.get("ok") else f"失败: {r.get('error')}")
+        elif rest[0] == "curve" and len(rest) > 1:
+            r = call({"op": "fan", "value": rest[1]})
+            print(f"曲线已启用: {rest[1]}" if r.get("ok") else f"失败: {r.get('error')}")
+        else:
+            sys.exit('用法: mrvctl fan auto | fan curve "T:P,..."')
+        sys.exit(0 if r.get("ok") else 1)
+    elif op == "kbd":
+        if rest and rest[0] == "color" and len(rest) >= 4:
+            r = call({"op": "kbd", "rgb": rest[1:4]})
+            print(f"RGB -> {r.get('rgb')}" if r.get("ok") else f"失败: {r.get('error')}")
+        elif rest and rest[0].isdigit():
+            r = call({"op": "kbd", "brightness": rest[0]})
+            print(f"背光 -> {r.get('brightness')}/{r.get('max')}" if r.get("ok") else f"失败: {r.get('error')}")
+        elif rest and rest[0] in ("off", "0"):
+            r = call({"op": "kbd", "brightness": 0})
+            print("背光已关闭" if r.get("ok") else f"失败: {r.get('error')}")
+        else:
+            sys.exit("用法: mrvctl kbd <0-200> | kbd color <R> <G> <B>")
+        sys.exit(0 if r.get("ok") else 1)
+    elif op == "charge":
+        if not rest:
+            sys.exit("用法: mrvctl charge <20-100>")
+        r = call({"op": "charge", "value": rest[0]})
+        print(f"限充阈值 -> {r.get('limit')}%" if r.get("ok") else f"失败: {r.get('error')}")
+        sys.exit(0 if r.get("ok") else 1)
+    elif op == "mux":
+        if not rest:
+            sys.exit("用法: mrvctl mux query | mux dgpu|igpu --yes")
+        if rest[0] == "query":
+            r = call({"op": "mux", "value": "query"})
+            print(f"Mux 状态 : {r.get('state')} (raw={r.get('raw')})" if r.get("ok")
+                  else f"查询失败: {r.get('raw')}")
+        elif rest[0] in ("dgpu", "igpu"):
+            if "--yes" not in rest:
+                print("Mux 切换会导致独显下电/上电并需要重启系统。")
+                print(f"确认请执行: mrvctl mux {rest[0]} --yes")
+                sys.exit(1)
+            r = call({"op": "mux", "value": rest[0], "confirm": True})
+            print(f"已发送: {r.get('note')}" if r.get("ok") else f"失败: {r.get('raw')}")
+        sys.exit(0)
+    else:
+        print(f"未知命令 {op}\n\n{__doc__.strip()}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    import signal
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)   # 管道被关闭时静默退出 (如 | head)
+    main()
