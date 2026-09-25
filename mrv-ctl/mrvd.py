@@ -498,6 +498,28 @@ def toggle_sysfs(name: str, enable: bool) -> dict:
 
 
 # ================================================================ 机型能力探测
+def cpu_model() -> str:
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    name = line.split(":", 1)[1].strip()
+                    return name.split(" w/ ")[0].replace(" with Radeon Graphics", "")
+    except OSError:
+        pass
+    return ""
+
+
+def gpu_name() -> str:
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=8).stdout.strip()
+        name = out.splitlines()[0] if out else ""
+        return name.replace("NVIDIA GeForce ", "").replace(" GPU", "")
+    except Exception:
+        return ""
+
+
 def probe_features() -> dict:
     """40/50 系多机型兼容: 探测本机支持的硬件能力, UI 按此自适应"""
     inou = INOU_DIR
@@ -522,6 +544,10 @@ def probe_features() -> dict:
         "super_key": os.path.exists(f"{inou}/super_key_enable"),
         "logo_light": False,       # lightbar 寄存器需实测, 默认隐藏
         "fan_control": FAN_WRITABLE,
+        "cpu_model": cpu_model(),
+        "gpu_name": gpu_name(),
+        "cpu_max_mhz": (v := read_text("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq"))
+                       and int(v) // 1000,
     }
     # mux 能力: DGPS 查询成功即支持
     out = acpi_method(f"{MUX_PATH}.DGPS")
