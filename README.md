@@ -181,7 +181,7 @@ EC 写入走 OEM 软件同样使用的 WMI 命令通道（由 EC 固件执行写
 
 ## 许可证
 
-本项目以 [MIT 许可证](LICENSE) 发布，以下文件除外：
+本项目以 [MIT 许可证](LICENSE) 发布，以下文件除外（另见 [NOTICE](NOTICE)）：
 
 - `mrv-ctl/docs/archive/tuxedo-mrv-1.0.patch`：基于 tuxedo-drivers 的补丁，沿用其 GPL-2.0-or-later 许可证；
 - `mrv-ctl/docs/acpi/`：从验证机导出的 ACPI 表，版权归设备厂商所有，仅供研究参考。

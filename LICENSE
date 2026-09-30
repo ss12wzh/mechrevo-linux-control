@@ -19,14 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-Exceptions:
-
-- mrv-ctl/docs/archive/tuxedo-mrv-1.0.patch is derived from tuxedo-drivers
-  (https://github.com/tuxedocomputers/tuxedo-drivers) and remains under
-  GPL-2.0-or-later.
-- mrv-ctl/docs/acpi/ contains ACPI tables dumped from the test laptop. They are
-  the property of the device manufacturer and are included for research
-  reference only.
