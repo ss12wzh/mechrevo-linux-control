@@ -4,7 +4,8 @@ Section: utils
 Priority: optional
 Architecture: all
 Depends: python3 (>= 3.10), python3-gi, gir1.2-gtk-3.0, gir1.2-ayatanaappindicator3-0.1, acpi-call-dkms
-Maintainer: mrv-ctl project <mrv-ctl@local>
+Maintainer: ss12wzh <313742508+ss12wzh@users.noreply.github.com>
+Homepage: https://github.com/ss12wzh/mechrevo-linux-control
 Description: 机械革命 Linux 控制台 (40/50 系游戏本)
  对标 Windows 版 L-Mechrevo 的开源控制台:
  性能模式、GPU 功耗解锁(Dynamic Boost)、键盘 RGB、
