@@ -20,6 +20,15 @@ import traceback
 import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk, GLib, Pango
+# ---- Wayland app_id：GTK3 用 g_get_prgname() 作为 xdg app_id。
+# 脚本运行时它是 "python3"/脚本名（实测 "mrv-gui"），而桌面条目叫 mrv-ctl.desktop，
+# GNOME 匹配不到就退回 application-x-executable（dock 显示齿轮图标）。
+GLib.set_prgname("mrv-ctl")
+GLib.set_application_name("mrv-ctl 机械革命控制台")
+try:
+    Gdk.set_program_class("mrv-ctl")   # X11/XWayland 的 WM_CLASS
+except Exception:
+    pass
 
 try:
     gi.require_version("AyatanaAppIndicator3", "0.1")
@@ -554,6 +563,10 @@ class MrvApp:
         self.win.set_decorated(False)
         self.win.set_resizable(False)
         self.win.set_icon_name("mrv-ctl")
+        try:
+            self.win.set_wmclass("mrv-ctl", "mrv-ctl")
+        except Exception:
+            pass
         rgba = enable_rgba(self.win)
         margin = SHADOW_MARGIN if rgba else 0
         self.win.connect("delete-event", self.on_delete)
