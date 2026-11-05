@@ -14,6 +14,7 @@ mrvd — 机械革命苍龙系列 Linux 控制台守护进程
 """
 
 import fcntl
+import glob
 import grp
 import json
 import os
@@ -59,7 +60,70 @@ EC_REG_ETPP = 0x07F7        # 平台总处理功耗 TPP -> NPCF.ATPP
 # CPU 功耗墙: EC 非自定义模式下 APL1/APL2 (0x0783/0x0784) 为 0, 由固件内部决定, 无寄存器可读;
 # 数值来自本机校准 (mrvctl calibrate) 或已验证机型档案 (data/models.json), 见 mrvmodel
 
-LED_DIR = "/sys/class/leds/uniwill:multicolor:status"
+# 键盘背光与机身灯条是两个独立 LED 设备。优先键盘背光 (kbd_backlight),
+# 找不到才退回灯条 (status)。两者量程不同 (本机实测 kbd: 亮度 0-4 / 通道 0-50,
+# status: 亮度 0-200 / 通道 0-200), 对外统一用 0-200 的 API 刻度, 读写时换算。
+KBD_API_MAX = 200
+
+
+def _pick_led_dir():
+    for pat in ("*kbd_backlight*", "uniwill:multicolor:status", "*multicolor*"):
+        hits = sorted(glob.glob(f"/sys/class/leds/{pat}"))
+        if hits:
+            return hits[0]
+    return "/sys/class/leds/uniwill:multicolor:status"
+
+
+def _read_int(path, default=None):
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return default
+
+
+def _led_chan_max():
+    try:
+        with open(f"{LED_DIR}/multi_max_intensity") as f:
+            vals = [int(x) for x in f.read().split() if x.lstrip("-").isdigit()]
+        if vals:
+            return max(vals)
+    except OSError:
+        pass
+    return 50 if "kbd" in LED_DIR else KBD_API_MAX
+
+
+def api_to_dev(v, mx):
+    """0-200 API 刻度 -> 设备刻度"""
+    if not mx:
+        return int(v)
+    return max(0, min(int(round(int(v) * mx / KBD_API_MAX)), mx))
+
+
+def dev_to_api(v, mx):
+    """设备刻度 -> 0-200 API 刻度"""
+    if not mx:
+        return int(v)
+    return max(0, min(int(round(int(v) * KBD_API_MAX / mx)), KBD_API_MAX))
+
+
+def led_brightness_api():
+    raw = _read_int(f"{LED_DIR}/brightness")
+    return None if raw is None else dev_to_api(raw, LED_MAX_BRIGHT)
+
+
+def led_rgb_api():
+    try:
+        with open(f"{LED_DIR}/multi_intensity") as f:
+            vals = [int(x) for x in f.read().split() if x.lstrip("-").isdigit()]
+    except OSError:
+        return None
+    return " ".join(str(dev_to_api(v, LED_CHAN_MAX)) for v in vals) if vals else None
+
+
+LED_DIR = _pick_led_dir()
+LED_MAX_BRIGHT = _read_int(f"{LED_DIR}/max_brightness", KBD_API_MAX) or KBD_API_MAX
+LED_CHAN_MAX = _led_chan_max()
 INOU_DIR = "/sys/devices/platform/INOU0000:00"
 HWMON_DIR = "/sys/class/hwmon"
 # 允许客户端开关的 INOU sysfs 属性 (白名单, 其他属性如 ctgp_offset 不对外开放)
@@ -444,19 +508,18 @@ def kbd_set(brightness=None, rgb=None, effect=None) -> dict:
                     out["ok"] = False
     if rgb is not None:
         if effect != "rainbow":          # 彩虹模式下固件接管颜色, 写了会闪回
-            r, g, b = (max(0, min(int(x), PWM_MAX)) for x in rgb)
+            r, g, b = (api_to_dev(x, LED_CHAN_MAX) for x in rgb)
             if led_write("multi_intensity", f"{r} {g} {b}"):
                 out["rgb"] = [r, g, b]
             else:
                 out["ok"] = False
     if brightness is not None:
         try:
-            with open(f"{LED_DIR}/max_brightness") as f:
-                mx = int(f.read().strip())
-            v = max(0, min(int(brightness), mx))
+            api_v = max(0, min(int(brightness), KBD_API_MAX))
+            v = api_to_dev(api_v, LED_MAX_BRIGHT)
             if led_write("brightness", str(v)):
-                out["brightness"] = v
-                out["max"] = mx
+                out["brightness"] = api_v
+                out["max"] = KBD_API_MAX
             else:
                 out["ok"] = False
         except OSError as e:
@@ -558,8 +621,8 @@ class AcLedGuard:
                 kbd_set(brightness=load_state().get("kbd_restore", 100))
                 log("插电: 恢复背光")
             else:
-                cur = read_text(f"{LED_DIR}/brightness")
-                if cur and cur.isdigit():
+                cur = led_brightness_api()
+                if cur is not None:
                     state_update(kbd_restore=int(cur))
                 kbd_set(brightness=0)
                 log("离电: 关闭背光")
@@ -830,8 +893,9 @@ def status():
         "fan_boost_ec": guard.ec_boost,
         "fan_guard": guard.guard,
         "overheat_guard": guard.auto_active,
-        "kbd_rgb": read_text(f"{LED_DIR}/multi_intensity"),
-        "kbd_brightness": read_text(f"{LED_DIR}/brightness"),
+        "kbd_rgb": led_rgb_api(),
+        "kbd_brightness": led_brightness_api(),
+        "kbd_led": LED_DIR,
         "kbd_rainbow": read_text(f"{INOU_DIR}/rainbow_animation") == "1",
         "toggles": {n: read_text(f"{INOU_DIR}/{n}") == "1" for n in TOGGLES
                     if os.path.exists(f"{INOU_DIR}/{n}")},
