@@ -18,6 +18,22 @@ import time
 import traceback
 from collections import deque
 
+# KDE Plasma Wayland 下 GTK3 会被 KWin 追加一层原生外框; 仅该环境回退 X11 (GNOME 保持 Wayland)
+if "kde" in os.environ.get("XDG_CURRENT_DESKTOP", "").lower() and os.environ.get("WAYLAND_DISPLAY"):
+    os.environ.setdefault("GDK_BACKEND", "x11")
+
+try:
+    _HERE = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _HERE = os.getcwd()
+for _p in (_HERE, "/opt/mrv"):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+try:
+    import mrvupdate
+except Exception:                  # 更新模块缺失不影响主功能
+    mrvupdate = None
+
 import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("PangoCairo", "1.0")
@@ -37,7 +53,7 @@ DEBUG = os.environ.get("MRV_GUI_DEBUG") == "1"
 def dbg(msg):
     if DEBUG:
         print(f"[gui {time.strftime('%T')}] {msg}", file=sys.stderr, flush=True)
-VERSION = "3.5.1"
+VERSION = "3.6.0"
 CONFIG_PATH = os.path.join(GLib.get_user_config_dir(), "mrv-ctl", "gui.json")
 SHADOW_MARGIN = 14              # 透明窗口外沿, 用来画面板阴影
 HISTORY_SPAN_S = 600            # 监控曲线窗口: 最近 10 分钟
@@ -238,6 +254,14 @@ button.icon-button {
 button.icon-button:hover { border-color: rgba(232, 238, 244, 0.238); background-color: rgba(255, 255, 255, 0.072); }
 button.icon-button.active { color: @mrv_accent; border-color: rgba(183, 234, 212, 0.30); }
 .version { color: rgba(163, 173, 187, 0.55); font-size: 10px; }
+.update-dot {
+  min-width: 7px; min-height: 7px; border-radius: 50%;
+  background-color: @mrv_accent; box-shadow: 0 0 6px rgba(183, 234, 212, 0.85);
+}
+.update-notes, .update-notes text {
+  background-color: rgba(4, 8, 13, 0.45); color: @mrv_text; font-size: 10px;
+}
+.update-notes { border-radius: 6px; }
 
 /* ---------- 弹出菜单 */
 popover.mrv-menu {
@@ -781,6 +805,8 @@ class MrvApp:
         self._fan_peak = 6000
         self._pending_mux = None
         self._dragging = set()          # 正在拖动的滑条, 刷新时不回写
+        self._upd = None                # 更新检查结果
+        self._upd_checking = False
 
         css = Gtk.CssProvider()
         css.load_from_data(CSS.encode("utf-8"))
@@ -831,6 +857,7 @@ class MrvApp:
         self._schedule_refresh()
         self.refresh()
         threading.Thread(target=self._query_mux, daemon=True).start()
+        GLib.timeout_add_seconds(6, self._startup_update_check)
 
     # ---------------------------------------------------- 构建 / 尺寸
     @staticmethod
@@ -1312,7 +1339,20 @@ class MrvApp:
         disc.connect("clicked", lambda *_: self._popup(self.view_menu))
         foot.pack_start(switcher, False, False, 0)
 
-        foot.pack_start(label(f"v{VERSION}", "version"), True, True, 0)
+        ver_ev = Gtk.EventBox()
+        ver_ev.set_visible_window(False)
+        ver_ev.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        ver_ev.connect("button-press-event", lambda *_: (self._manual_check_update(), False)[1])
+        ver_box = Gtk.Box(spacing=6)
+        ver_box.set_valign(Gtk.Align.CENTER)
+        ver_box.pack_start(label(f"v{VERSION}", "version"), False, False, 0)
+        self.update_dot = add_class(Gtk.Box(), "update-dot")
+        self.update_dot.set_valign(Gtk.Align.CENTER)
+        self.update_dot.set_no_show_all(True)
+        self.update_dot.set_tooltip_text("检查更新")
+        ver_box.pack_start(self.update_dot, False, False, 0)
+        ver_ev.add(ver_box)
+        foot.pack_start(ver_ev, True, True, 0)
 
         self.bubble_btn = add_class(Gtk.Button(), "icon-button")
         self.bubble_btn.add(icon("focus-windows-symbolic", 14, None))
@@ -1327,6 +1367,7 @@ class MrvApp:
             ("keep_above", "窗口置顶", lambda *_: self.set_keep_above(not self.cfg.get("keep_above", False))),
             ("bubble", "悬浮窗", lambda *_: self.set_bubble(not self.bubble.get_visible())),
             ("calibrate", "校准功耗墙", lambda *_: self._send({"op": "calibrate"})),
+            ("update", "检查更新", lambda *_: self._manual_check_update()),
             None,
             ("quit", "退出 mrv-ctl", self.on_quit),
         ])
@@ -1753,6 +1794,201 @@ class MrvApp:
         GLib.timeout_add(4000, lambda: (self.status_lbl.hide(), False)[1])
         return False
 
+    # ---------------------------------------------------- 自动更新
+    def _startup_update_check(self):
+        if mrvupdate:
+            self._start_update_check(manual=False)
+        return False
+
+    def _manual_check_update(self):
+        if self._upd_checking:
+            return
+        self._upd_checking = True
+        self._flash_message("正在检查更新…")
+        self._start_update_check(manual=True)
+
+    def _start_update_check(self, manual=False):
+        def run():
+            try:
+                if mrvupdate is None:
+                    raise RuntimeError("更新模块不可用")
+                info = mrvupdate.check(VERSION, force=manual)
+                GLib.idle_add(self._update_checked, info, manual)
+            except Exception as e:
+                GLib.idle_add(self._update_check_failed, e, manual)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _update_checked(self, info, manual):
+        self._upd_checking = False
+        self._upd = info
+        avail = bool(info.get("available"))
+        if avail:
+            self.update_dot.show()
+            self.update_dot.set_tooltip_text(f"发现新版本 v{info.get('version')}，点击查看")
+        else:
+            self.update_dot.hide()
+        if manual:
+            self._show_update_dialog(info)
+        return False
+
+    def _update_check_failed(self, exc, manual):
+        self._upd_checking = False
+        kind = getattr(exc, "kind", "")
+        msg = getattr(exc, "message", str(exc))
+        pretty = {
+            "network": "网络不可用，请检查网络后重试",
+            "rate_limit": "GitHub API 访问受限，请稍后再试",
+            "no_release": "仓库尚未发布 Release，稍后再试",
+        }.get(kind, msg)
+        if manual:
+            self._info_dialog("检查更新", pretty)
+        else:
+            dbg(f"update: {kind} {msg}")
+        return False
+
+    def _flash_message(self, msg, ms=3000):
+        self.status_lbl.set_text(msg)
+        ctx = self.status_lbl.get_style_context()
+        ctx.remove_class("status-error")
+        self.status_lbl.show()
+
+        def done():
+            self.status_lbl.hide()
+            ctx.add_class("status-error")
+            return False
+        GLib.timeout_add(ms, done)
+
+    def _dialog(self, title):
+        """暗色风格对话框 (复用面板视觉)"""
+        dlg = Gtk.Dialog(title=title, transient_for=self.win, modal=True)
+        dlg.set_decorated(False)
+        dlg.set_default_size(420, -1)
+        box = dlg.get_content_area()
+        add_class(box, "shell")
+        box.set_spacing(10)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{side}")(10)
+        head = Gtk.Box(spacing=8)
+        head.pack_start(label(title, "section-name"), True, True, 0)
+        close = add_class(Gtk.Button(), "win-btn")
+        close.add(icon("window-close-symbolic", 12, None))
+        close.connect("clicked", lambda *_: dlg.response(Gtk.ResponseType.CLOSE))
+        head.pack_end(close, False, False, 0)
+        box.pack_start(head, False, False, 0)
+        return dlg, box
+
+    def _info_dialog(self, title, text):
+        dlg, box = self._dialog(title)
+        box.pack_start(label(text, "metric-label", wrap=True), False, False, 0)
+        dlg.show_all()
+        dlg.run()
+        dlg.destroy()
+
+    def _show_update_dialog(self, info):
+        dlg, box = self._dialog("软件更新")
+        cur = f"当前版本 v{VERSION}"
+        if not info or not info.get("available"):
+            box.pack_start(label(cur + "，已是最新版本。", "metric-label"), False, False, 0)
+            dlg.show_all()
+            dlg.run()
+            dlg.destroy()
+            return
+
+        box.pack_start(label(f"{cur}  →  最新 v{info.get('version')}", "section-name"),
+                       False, False, 0)
+        if info.get("published"):
+            box.pack_start(label(f"发布时间 {info['published'][:10]}", "metric-sub"),
+                           False, False, 0)
+        if info.get("notes"):
+            sw = Gtk.ScrolledWindow()
+            sw.set_min_content_height(110)
+            sw.set_max_content_height(220)
+            sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            tv = Gtk.TextView(editable=False, cursor_visible=False)
+            tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+            add_class(tv, "update-notes")
+            tv.get_buffer().set_text(info["notes"])
+            sw.add(tv)
+            box.pack_start(sw, False, False, 0)
+
+        progress = Gtk.ProgressBar()
+        progress.set_no_show_all(True)
+        box.pack_start(progress, False, False, 0)
+        status = label("", "metric-sub", wrap=True)
+        status.set_no_show_all(True)
+        box.pack_start(status, False, False, 0)
+
+        row = Gtk.Box(spacing=8)
+        page = add_class(Gtk.Button(label="打开发布页"), "pill-btn")
+        page.connect("clicked", lambda *_: mrvupdate and mrvupdate.open_release_page(info.get("url")))
+        row.pack_start(page, False, False, 0)
+        asset = info.get("asset")
+        if asset:
+            btn = add_class(Gtk.Button(label="下载并安装"), "pill-btn")
+            btn.connect("clicked", lambda *_: self._download_update(info, progress, status, btn))
+            row.pack_end(btn, False, False, 0)
+        else:
+            box.pack_start(label("该版本未提供 .deb 资产，请到发布页手动下载。", "metric-sub"),
+                           False, False, 0)
+        box.pack_start(row, False, False, 0)
+        dlg.show_all()
+        dlg.run()
+        dlg.destroy()
+
+    def _download_update(self, info, progress, status, btn):
+        asset = info.get("asset") or {}
+        dest = os.path.join(GLib.get_user_cache_dir(), "mrv-ctl",
+                            asset.get("name") or "mrv-ctl_update.deb")
+        btn.set_sensitive(False)
+        progress.show()
+        status.show()
+        status.set_text("准备下载…")
+
+        def prog(done, total):
+            GLib.idle_add(self._update_progress, progress, status, done, total)
+
+        def run():
+            try:
+                mrvupdate.download(asset["url"], dest, prog)
+                GLib.idle_add(self._update_downloaded, dest, status, progress)
+            except Exception as e:
+                GLib.idle_add(self._update_failed, e, status)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _update_progress(self, progress, status, done, total):
+        if total:
+            progress.set_fraction(min(1.0, done / total))
+            status.set_text(f"下载中 {done / 1048576:.1f} / {total / 1048576:.1f} MB")
+        else:
+            progress.pulse()
+            status.set_text(f"下载中 {done / 1048576:.1f} MB")
+        return False
+
+    def _update_downloaded(self, path, status, progress):
+        progress.set_fraction(1.0)
+        status.set_text("下载完成，等待授权安装…")
+
+        def run():
+            try:
+                mrvupdate.install_deb(path)
+                GLib.idle_add(self._update_installed, status)
+            except Exception as e:
+                GLib.idle_add(self._update_failed, e, status)
+        threading.Thread(target=run, daemon=True).start()
+        return False
+
+    def _update_installed(self, status):
+        status.set_text("安装完成，请重启 mrv-ctl 生效")
+        self.update_dot.hide()
+        return False
+
+    def _update_failed(self, exc, status):
+        msg = getattr(exc, "message", str(exc))
+        status.show()
+        status.set_text(f"失败：{msg}")
+        status.get_style_context().add_class("status-error")
+        return False
+
     def on_profile(self, key):
         if self._suppress:
             return True
@@ -1850,8 +2086,59 @@ class MrvApp:
             self._send({"op": "toggle", "name": key, "value": sw.get_active()})
 
 
+# ============================================================ 单实例
+SINGLE_SOCK = f"/run/user/{os.getuid()}/mrv-gui.sock"
+
+
+def _wake_existing_instance():
+    """已有实例在跑就唤醒它并退出本次启动 (避免重复托盘图标)"""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(1.0)
+    try:
+        s.connect(SINGLE_SOCK)
+        s.sendall(b"show")
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _serve_single_instance(app):
+    try:
+        os.unlink(SINGLE_SOCK)
+    except OSError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        srv.bind(SINGLE_SOCK)
+        srv.listen(2)
+    except OSError:
+        return
+
+    def loop():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            try:
+                conn.recv(16)
+                GLib.idle_add(app.show_main)
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
 def main():
+    if _wake_existing_instance():
+        print("mrv-ctl 已在运行，已唤出窗口", file=sys.stderr)
+        return
     app = MrvApp()
+    _serve_single_instance(app)
     app.win.show_all()
     if app.cfg.get("bubble"):
         app.set_bubble(True)
