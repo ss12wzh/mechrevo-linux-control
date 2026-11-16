@@ -278,16 +278,13 @@ button.icon-button.active { color: @mrv_accent; border-color: rgba(183, 234, 212
 }
 
 /* ---------- 对话框 (默认主题是白底, 会露出白框) */
-/* GTK3 里 GtkDialog 的 CSS 节点名是 dialog (不是 window), 两个都要覆盖 */
+/* 对话框: 窗口透明, 只由 .shell 画面板 (与主窗口一致, 避免出现外层矩形) */
+dialog.mrv-window, dialog.mrv-window.background {
+  background-color: transparent; background-image: none;
+}
 dialog.mrv-dialog, dialog.mrv-dialog.background,
 window.mrv-dialog, window.mrv-dialog.background {
   background-color: #282c32; color: @mrv_text; border: none;
-}
-dialog.mrv-dialog decoration, window.mrv-dialog decoration {
-  border: none; box-shadow: none; background-color: transparent;
-}
-dialog.mrv-dialog .shell, window.mrv-dialog .shell {
-  border-radius: 10px; border-color: transparent; box-shadow: none;
 }
 
 /* ---------- 弹出菜单 */
@@ -1898,13 +1895,16 @@ class MrvApp:
         """暗色风格对话框 (复用面板视觉)"""
         dlg = Gtk.Dialog(title=title, transient_for=self.win, modal=True)
         dlg.set_decorated(False)
-        dlg.set_default_size(440, -1)
-        add_class(dlg, "mrv-dialog")
+        dlg.set_default_size(440 + 2 * SHADOW_MARGIN, -1)
+        rgba = enable_rgba(dlg)          # 透明窗口, 面板自己画圆角与阴影
         box = dlg.get_content_area()
-        add_class(box, "shell")
+        add_class(box, "shell", *(() if rgba else ("opaque",)))
+        if not rgba:
+            add_class(dlg, "mrv-dialog")  # 无合成器时退化为整窗暗色
         box.set_spacing(10)
+        margin = SHADOW_MARGIN if rgba else 0
         for side in ("top", "bottom", "start", "end"):
-            getattr(box, f"set_margin_{side}")(10)
+            getattr(box, f"set_margin_{side}")(margin)
         head = Gtk.Box(spacing=8)
         head.pack_start(label(title, "section-name"), True, True, 0)
         close = add_class(Gtk.Button(), "win-btn")
