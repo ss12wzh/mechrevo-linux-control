@@ -494,8 +494,85 @@ def _kbd_apply_rgb(r_api, g_api, b_api) -> bool:
     return ec_write(EC_REG_RGB_TRIGGER, EC_BIT_RGB_APPLY)
 
 
+# ---------- ITE 8291 USB RGB 键盘灯 (苍龙 16X Pro 等新机型) ----------
+# 这类机型键盘灯挂在 USB HID 控制器 (048d:600b 等) 上, 写 EC/sysfs 无效。
+HIDIOCSFEATURE_8 = 0xC0084806  # _IOC(_IOC_WRITE|_IOC_READ, 'H', 0x06, 8)
+RAINBOW_PALETTE = ((255, 0, 0), (255, 127, 0), (255, 255, 0), (0, 255, 0),
+                   (0, 255, 255), (0, 80, 255), (180, 0, 255))
+_ite_lock = threading.Lock()
+
+
+def find_ite8291():
+    """查找 ITE 8291 (048D:600B/6004/600A/CE00) 的 hidraw 设备与 sysfs 目录"""
+    for p in sorted(_glob.glob("/sys/bus/hid/devices/*048D:*")):
+        hids = sorted(_glob.glob(f"{p}/hidraw/hidraw*"))
+        if hids:
+            dev = f"/dev/{os.path.basename(hids[0])}"
+            if os.path.exists(dev):
+                return dev, p
+    return None, None
+
+
+def ite8291_apply(effect: str, brightness: int, rgb: list) -> bool:
+    """经 hidraw 下发灯光 (亮度 0-200; 支持 solid/rainbow/off)"""
+    dev, sysfs_dir = find_ite8291()
+    if not dev:
+        return False
+    buf_ctrl = f"{sysfs_dir}/controls/buffer_input" if sysfs_dir else None
+    if buf_ctrl and os.path.exists(buf_ctrl):
+        try:
+            with open(buf_ctrl, "w") as f:
+                f.write("1")
+        except OSError:
+            pass
+
+    br200 = max(0, min(int(brightness), PWM_MAX))
+    br50 = 0 if (effect == "off" or br200 == 0) else max(1, min(50, round(br200 * 50 / PWM_MAX)))
+    if sysfs_dir and os.path.exists(f"{sysfs_dir}/leds/rgb:kbd_backlight/brightness"):
+        try:
+            with open(f"{sysfs_dir}/leds/rgb:kbd_backlight/brightness", "w") as f:
+                f.write(str(br50))
+        except OSError:
+            pass
+    r200, g200, b200 = (max(0, min(int(x), PWM_MAX)) for x in (rgb or (120, 200, 160))[:3])
+    r255 = round(r200 * 255 / PWM_MAX)
+    g255 = round(g200 * 255 / PWM_MAX)
+    b255 = round(b200 * 255 / PWM_MAX)
+
+    def send_ctrl(fd, pkt):
+        buf = bytearray(pkt)
+        fcntl.ioctl(fd, HIDIOCSFEATURE_8, buf)
+
+    with _ite_lock:
+        fd = os.open(dev, os.O_RDWR)
+        try:
+            if effect == "off" or br50 == 0:
+                send_ctrl(fd, [0x08, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+            elif effect == "rainbow":
+                for idx, (pr, pg, pb) in enumerate(RAINBOW_PALETTE, start=1):
+                    send_ctrl(fd, [0x14, 0x00, idx, pr, pg, pb, 0x00, 0x00])
+                send_ctrl(fd, [0x08, 0x02, 0x03, 0x05, br50, 0x08, 0x01, 0x00])
+            else:
+                send_ctrl(fd, [0x08, 0x02, 0x33, 0x00, br50, 0x00, 0x00, 0x00])
+                row_pkt = bytes([0x00, 0x00]) + bytes([b255] * 21) + bytes([g255] * 21) + bytes([r255] * 21)
+                for row in range(6):
+                    send_ctrl(fd, [0x16, 0x00, row, 0x00, 0x00, 0x00, 0x00, 0x00])
+                    os.write(fd, row_pkt)
+        finally:
+            os.close(fd)
+    return True
+
+
 def kbd_read() -> dict:
-    """从 EC 读键盘灯状态; RGB 换算回 GUI 0-200 色域"""
+    """从 EC 读键盘灯状态; RGB 换算回 GUI 0-200 色域; ITE 8291 机型读已保存状态"""
+    if find_ite8291()[0]:
+        saved = load_state().get("kbd") or {}
+        rgb = saved.get("rgb") or [120, 200, 160]
+        return {
+            "kbd_rgb": " ".join(str(int(x)) for x in rgb[:3]),
+            "kbd_brightness": str(int(saved.get("brightness", 0))),
+            "kbd_rainbow": saved.get("effect") == "rainbow",
+        }
     st = ec_read(EC_REG_KBD_STATUS)
     r, g, b = ec_read(EC_REG_RGB_RED), ec_read(EC_REG_RGB_GREEN), ec_read(EC_REG_RGB_BLUE)
     trig = ec_read(EC_REG_RGB_TRIGGER)
@@ -531,6 +608,23 @@ def kbd_read_cached() -> dict:
 def kbd_set(brightness=None, rgb=None, effect=None) -> dict:
     """键盘灯经 WKBC 写 EC。亮度变化必须重 APPLY 颜色, 否则固件会掉出 RGB 模式变成「调亮度=换色」。"""
     out = {"ok": True, "max": PWM_MAX}
+    # 新机型: ITE 8291 USB 控制器优先 (无该芯片时自动走下面 EC 路径)
+    ite_dev, _ite_dir = find_ite8291()
+    if ite_dev:
+        saved = load_state().get("kbd") or {}
+        eff = effect or saved.get("effect") or "solid"
+        br = int(brightness) if brightness is not None else int(saved.get("brightness", 100))
+        rgbv = [int(x) for x in (rgb if rgb is not None else saved.get("rgb") or [120, 200, 160])[:3]]
+        if eff == "off":
+            br = 0
+        ok = ite8291_apply(eff, br, rgbv)
+        out.update({"ok": ok, "brightness": br, "rgb": rgbv, "effect": eff, "backend": "ite8291"})
+        if not ok:
+            out["error"] = "ITE8291 写入失败"
+        else:
+            state_update(kbd={"brightness": br, "rgb": rgbv, "effect": eff})
+            _kbd_cache["t"] = 0.0
+        return out
     if not _kbd_ensure_china_mode():
         return {"ok": False, "error": "无法启用键盘灯 (EC BIOS_OEM_2)"}
 
@@ -666,8 +760,10 @@ def probe_features(dsdt: dict) -> dict:
         "charge": gates["charge"]["ok"],
         "fan": bool(HW),
         # 键盘灯走 EC/WKBC; 状态灯条 sysfs 不是键盘。SUPPORT_2 bit2 = RGB_KEYBOARD
-        "rgb": ec_read(EC_REG_KBD_STATUS) is not None and bool((ec_read(0x0766) or 0) & 0x04),
-        "rainbow": True,           # 彩虹经 EC TRIGGER bit7, 不依赖可能无效的 sysfs
+        "rgb": bool(find_ite8291()[0]) or (
+            ec_read(EC_REG_KBD_STATUS) is not None and bool((ec_read(0x0766) or 0) & 0x04)),
+        "rainbow": True,           # 彩虹经 EC TRIGGER bit7 / ITE 硬件动画, 不依赖 sysfs
+        "kbd_backend": "ite8291" if find_ite8291()[0] else "ec",
         "breathing": os.path.exists(f"{inou}/breathing_in_suspend"),
         "fn_lock": os.path.exists(f"{inou}/fn_lock"),
         "super_key": os.path.exists(f"{inou}/super_key_enable"),
@@ -1044,29 +1140,38 @@ def _smi_float(s):
 
 
 _gpu_cache = {"t": 0.0, "v": None}
+_gpu_idle = 0                   # 连续空闲采样次数
 GPU_TTL_ACTIVE = 4.0            # 有负载时正常刷新
-GPU_TTL_IDLE = 30.0             # 空闲: 拉长间隔, 给 RTD3 留出休眠窗口
-GPU_TTL_BATTERY = 90.0          # 离电休眠策略生效时更激进
+GPU_TTL_IDLE = 300.0            # 连续空闲后长间隔, 让 RTD3 真正睡下去
+GPU_TTL_BATTERY = 600.0         # 离电休眠策略生效时更激进
 
 
 def _gpu_ttl():
     v = _gpu_cache["v"] or {}
     if v.get("suspended") or v.get("error"):
         return 15.0
-    idle = (v.get("util_pct") or 0) < 1 and (v.get("draw_w") or 0) < 5
-    if idle:
-        if hybrid_battery_igpu and hybrid_battery_igpu.active:
-            return GPU_TTL_BATTERY
-        return GPU_TTL_IDLE
+    if _gpu_idle >= 2:
+        return GPU_TTL_BATTERY if (hybrid_battery_igpu and hybrid_battery_igpu.active) else GPU_TTL_IDLE
     return GPU_TTL_ACTIVE
 
 
 def gpu_info():
-    """GPU 功耗 + 显存 + 频率 + 利用率 (缓存 + 空闲降频, 避免把 RTD3 睡下的独显唤醒)"""
+    """GPU 功耗/显存/频率/利用率。
+    sysfs 检查是免费的: 已挂起就直接报 suspended, 绝不碰 nvidia-smi 把它唤醒;
+    连续两次空闲后进入长间隔轮询, 让 RTD3 有窗口进入 D3cold。"""
+    global _gpu_idle
+    if gpu_suspended():
+        if not (_gpu_cache["v"] or {}).get("suspended"):
+            _gpu_cache.update(t=time.time(), v={"suspended": True})
+            _gpu_idle = 0
+        return {"suspended": True}
     now = time.time()
     if _gpu_cache["v"] is not None and now - _gpu_cache["t"] < _gpu_ttl():
         return _gpu_cache["v"]
     out = _gpu_info()
+    idle = bool(out.get("draw_w") is not None and (out.get("util_pct") or 0) < 1
+                and (out.get("draw_w") or 0) < 5)
+    _gpu_idle = _gpu_idle + 1 if idle else 0
     _gpu_cache.update(t=now, v=out)
     return out
 
