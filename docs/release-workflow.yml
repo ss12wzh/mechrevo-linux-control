@@ -1,0 +1,31 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 写入版本号
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "s/^Version: .*/Version: $VERSION/" debian/control
+          sed -i "s/^VERSION = .*/VERSION = \"$VERSION\"/" mrv-gui
+
+      - name: 构建 deb
+        run: |
+          bash build-deb.sh
+          ls -l dist/
+
+      - name: 发布到 Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.deb
+          generate_release_notes: true
