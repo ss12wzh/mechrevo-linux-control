@@ -72,3 +72,8 @@ Unix socket `/run/mrvd/mrvd.sock`，每个连接发送一个 JSON 请求、读�
 ## 新增机型档案
 
 在 `data/models.json` 追加一项：`match`（`board_prefix`，可选 `vendor` / `cpu_contains` / `gfid`）、`verified`（BIOS、日期、数据来源）、`cpu_ppt_w`（`mrvctl calibrate` 结果）。只写实机测过的数值。
+
+## 发布与 CI
+
+- 发布：`bash build-deb.sh` 后用 `gh release create vX.Y.Z dist/*.deb -R ss12wzh/mechrevo-linux-control` 上传；GUI 自动更新读取该 Release。
+- GitHub Actions 模板见 [`docs/release-workflow.yml`](docs/release-workflow.yml)。启用方法：`gh auth refresh -h github.com -s workflow`，再把模板复制到 `.github/workflows/release.yml` 提交；缺少 `workflow` scope 时 GitHub 会拒绝推送该路径。
