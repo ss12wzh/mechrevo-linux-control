@@ -1,0 +1,9 @@
+Third-party files in this repository that are NOT covered by the MIT License:
+
+
+- mrv-ctl/docs/archive/tuxedo-mrv-1.0.patch is derived from tuxedo-drivers
+  (https://github.com/tuxedocomputers/tuxedo-drivers) and remains under
+  GPL-2.0-or-later.
+- mrv-ctl/docs/acpi/ contains ACPI tables dumped from the test laptop. They are
+  the property of the device manufacturer and are included for research
+  reference only.
