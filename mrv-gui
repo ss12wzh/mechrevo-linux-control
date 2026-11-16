@@ -278,11 +278,15 @@ button.icon-button.active { color: @mrv_accent; border-color: rgba(183, 234, 212
 }
 
 /* ---------- 对话框 (默认主题是白底, 会露出白框) */
+/* GTK3 里 GtkDialog 的 CSS 节点名是 dialog (不是 window), 两个都要覆盖 */
+dialog.mrv-dialog, dialog.mrv-dialog.background,
 window.mrv-dialog, window.mrv-dialog.background {
   background-color: #282c32; color: @mrv_text; border: none;
 }
-window.mrv-dialog decoration { border: none; box-shadow: none; background-color: transparent; }
-window.mrv-dialog .shell {
+dialog.mrv-dialog decoration, window.mrv-dialog decoration {
+  border: none; box-shadow: none; background-color: transparent;
+}
+dialog.mrv-dialog .shell, window.mrv-dialog .shell {
   border-radius: 10px; border-color: transparent; box-shadow: none;
 }
 
