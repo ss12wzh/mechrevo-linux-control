@@ -18,6 +18,15 @@ cat > /etc/modprobe.d/mrv-uniwill.conf <<'EOF'
 options uniwill_laptop force=1
 EOF
 
+echo "mrv-ctl: 配置 NVIDIA 独显运行时电源 (RTD3)..."
+# 独显 / HDMI 音频允许空闲挂起; nvidia-persistenced 会阻止 RTD3, 屏蔽之
+udevadm control --reload-rules 2>/dev/null || true
+udevadm trigger --action=add --subsystem-match=pci --attr-match=vendor=0x10de 2>/dev/null || true
+systemctl mask nvidia-persistenced.service 2>/dev/null || true
+systemctl stop nvidia-persistenced.service 2>/dev/null || true
+# 新的 nvidia 模块参数需要重建 initramfs 才会在早期加载时生效
+update-initramfs -u 2>/dev/null || true
+
 # 旧版 install.sh 的残留: /etc 下的同名 unit 会遮蔽包内 unit
 rm -f /etc/modules-load.d/mrv.conf /usr/local/bin/mrvctl /etc/systemd/system/mrvd.service
 

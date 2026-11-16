@@ -7,14 +7,18 @@ PKG="mrv-ctl_${VER}_all"
 ROOT="$(mktemp -d)/${PKG}"
 
 mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/bin" "$ROOT/opt/mrv" "$ROOT/lib/systemd/system" \
-         "$ROOT/usr/share/icons/hicolor/256x256/apps" "$ROOT/usr/share/mrv-ctl"
+         "$ROOT/usr/share/icons/hicolor/256x256/apps" "$ROOT/usr/share/mrv-ctl" \
+         "$ROOT/etc/modprobe.d" "$ROOT/etc/udev/rules.d"
 
 install -m 755 mrvd.py      "$ROOT/opt/mrv/mrvd.py"
 install -m 644 mrvmodel.py  "$ROOT/opt/mrv/mrvmodel.py"
+install -m 644 mrvupdate.py "$ROOT/opt/mrv/mrvupdate.py"
 install -m 644 data/models.json "$ROOT/usr/share/mrv-ctl/models.json"
 install -m 755 mrvctl       "$ROOT/usr/bin/mrvctl"
 install -m 755 mrv-gui      "$ROOT/usr/bin/mrv-gui"
 install -m 644 mrvd.service "$ROOT/lib/systemd/system/mrvd.service"
+install -m 644 debian/mrv-nvidia-pm.conf      "$ROOT/etc/modprobe.d/mrv-nvidia-pm.conf"
+install -m 644 debian/80-mrv-nvidia-rtd3.rules "$ROOT/etc/udev/rules.d/80-mrv-nvidia-rtd3.rules"
 install -m 644 icons/mrv-ctl.png "$ROOT/usr/share/icons/hicolor/256x256/apps/mrv-ctl.png"
 
 install -m 644 debian/control  "$ROOT/DEBIAN/control"

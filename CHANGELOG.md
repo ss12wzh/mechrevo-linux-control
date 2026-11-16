@@ -1,5 +1,20 @@
 # 变更记录
 
+## 3.6.0 — 2026-11-16 · 稳定性 / RTD3 / 自动更新
+
+- 修复点击任意控制项后 GUI 单核 100% CPU 的死循环（idle 回调返回 `True` 导致永久重复执行）
+- 窗口解除固定尺寸：可自由拖动缩放，默认 420 宽，尺寸/位置按显示器工作区自适应并记忆；修复高分屏与 100% 缩放下的异常尺寸
+- 修复离电时 EC 返回 `0x20/0x80` 被误判为 `custom` 档位，导致物理键联动失效
+- 驱动缺失时 GUI 明确提示「NVIDIA 驱动未加载」，不再把 nvidia-smi 报错文本当成显卡型号
+- 混合模式改为 RTD3 状态机：离电强制独显进入 D3hot/D3cold；移除无效的 `nvidia-smi drain` 与有黑屏风险的运行时 `IGPS`
+- GPU 遥测按空闲程度自适应降频（空闲 5 分钟级），避免轮询把 RTD3 睡下的独显反复唤醒
+- 新增 logind 睡眠/唤醒监听：睡前冻结采样与 EC 轮询，唤醒后恢复档位/限充/键盘灯/INOU 开关
+- 新增 ITE 8291 USB 键盘灯后端（苍龙 16X Pro 等新机型），无该芯片自动回退 EC
+- 新增自动更新：GitHub Release 检查（6 小时缓存）、发布说明、`.deb` 下载与 `pkexec` 授权安装、网络/限流/无 Release 等友好错误提示；页脚版本号与设置菜单均可触发
+- 新增 GitHub Actions：推送 `v*` tag 自动构建 deb 并发布 Release
+- 单实例唤醒（重复启动直接唤出已有窗口）；KDE Plasma Wayland 自动走 X11，避免多一层原生外框
+- 随包安装 RTD3 配置（`/etc/modprobe.d/mrv-nvidia-pm.conf`、`/etc/udev/rules.d/80-mrv-nvidia-rtd3.rules`），并屏蔽阻止独显休眠的 `nvidia-persistenced`
+
 ## 3.5.1 — 2026-10-17 · 性能与稳定性
 
 - 修复监控页明细行在第二次刷新时抛异常（`_fill_rows` 行缓存误用）：此前 GUI 每 2 秒输出一条 traceback 并中断页面更新
