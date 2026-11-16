@@ -1,0 +1,10 @@
+[
+  {
+    "id": "mechrevo-canglong-m6dr55",
+    "name": "机械革命 苍龙 (M6DR55xx, R9 8945HX + RTX 5060)",
+    "match": {"board_prefix": "CANGLONG Series-M6DR55"},
+    "verified": {"bios": "N.1.16MRO13", "date": "2026-09-25", "data": "docs/perf/4-final.jsonl"},
+    "cpu_ppt_w": {"office": 45, "balanced": 87, "boost": 130},
+    "notes": "CPU 功耗墙为 openssl 32 进程满载稳态; 狂暴档 45 秒稳态受 97°C 温度墙限制约 123 W"
+  }
+]
