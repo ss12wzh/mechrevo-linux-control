@@ -219,7 +219,9 @@ def get_profile():
     if v is None:
         return "unknown"
     bits = v & PROFILE_CLEAR
-    return {0xA0: "office", 0x10: "boost", 0x00: "balanced"}.get(
+    # 离电时 EC 可能清 bit7 只留 bit5 (0x20) / 仅留 bit7 (0x80), 都属于静音档
+    return {0xA0: "office", 0x80: "office", 0x20: "office",
+            0x10: "boost", 0x00: "balanced"}.get(
         bits, f"custom(0x{v:02X})")
 
 
@@ -306,6 +308,9 @@ def profile_watch_loop():
     """物理键检测: 固件自行切换 EC 档位而不通知 Linux, 这里轮询感知并联动"""
     global _profile_seen
     while True:
+        if sleeping.is_set():
+            time.sleep(1)
+            continue
         try:
             with _profile_lock:
                 cur = get_profile()
@@ -371,6 +376,9 @@ class ThermalGuard(threading.Thread):
 
     def run(self):
         while not self.stop_evt.is_set():
+            if sleeping.is_set():
+                self.stop_evt.wait(GUARD_POLL)
+                continue
             try:
                 temp = self.current_temp()
                 with self.lock:
@@ -589,6 +597,12 @@ def kbd_set(brightness=None, rgb=None, effect=None) -> dict:
             out["ok"], out["error"] = False, "写键盘亮度失败"
 
     _kbd_cache["t"] = 0.0               # 写完失效, 下一次 status 立即读到新值
+    if out.get("ok"):
+        saved = dict(load_state().get("kbd") or {})
+        for k in ("brightness", "rgb", "effect"):
+            if k in out:
+                saved[k] = out[k]
+        state_update(kbd=saved)         # 睡眠/开机后按此恢复
     return out
 
 
@@ -608,11 +622,19 @@ def toggle_sysfs(name: str, enable: bool) -> dict:
 
 
 # ================================================================ 机型能力探测
+def nvidia_driver_ok() -> bool:
+    """nvidia 模块是否已加载 (缺 /proc/driver/nvidia/version 时 nvidia-smi 必失败)"""
+    return os.path.exists("/proc/driver/nvidia/version")
+
+
 def gpu_name() -> str:
     try:
         out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
                              capture_output=True, text=True, timeout=8).stdout.strip()
         name = out.splitlines()[0] if out else ""
+        # 驱动缺失时 nvidia-smi 会把报错打到 stdout, 不能当成型号
+        if not name or "NVIDIA-SMI has failed" in name or name.startswith("NVIDIA-SMI"):
+            return ""
         return name.replace("NVIDIA GeForce ", "").replace(" GPU", "")
     except Exception:
         return ""
@@ -654,6 +676,7 @@ def probe_features(dsdt: dict) -> dict:
         "ec_channel": "wkbc" if EC_VIA_WKBC else "mmio",
         "cpu_model": ident["cpu"],
         "gpu_name": gpu_name(),
+        "gpu_driver": nvidia_driver_ok(),
         # cpuinfo_max_freq 在关睿频后变成基础频率; amd_pstate_max_freq 始终是最高睿频
         "cpu_max_mhz": (v := read_text("/sys/devices/system/cpu/cpu0/cpufreq/amd_pstate_max_freq")
                         or read_text("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")) and int(v) // 1000,
@@ -702,11 +725,12 @@ class AcLedGuard:
 ac_led_guard = None
 
 
-# ================================================================ 混合模式 · 离电用集显
-# 等同 Windows 控制台「核显省电」意图: 混合输出下拔电禁用独显新负载, 插电恢复。
-# Linux 上 IGPS  alone 无法在驱动占用时下电; 用 nvidia-smi drain + 禁止 PRIME 卸载。
+# ================================================================ 混合模式 · 离电独显休眠 (RTD3)
+# 本模具无 ACPI _PR3 (D3cold 不可用), nvidia-smi drain 也不会真正断电;
+# 能做到的是让驱动空闲时把 GPU 挂进 D3hot (RTD3), 并避免我们的轮询把刚睡下的独显唤醒。
 BATTERY_IGPU_FLAG = f"{RUN_DIR}/battery-igpu"
 hybrid_battery_igpu = None
+sleeping = threading.Event()        # logind PrepareForSleep 期间置位
 
 
 def _ac_online() -> bool | None:
@@ -717,44 +741,14 @@ def _ac_online() -> bool | None:
         return None
 
 
-def _nvidia_bus_id() -> str:
+def gpu_runtime_status():
+    """sysfs 读独显运行时电源状态 (纯读, 不会唤醒独显)"""
     p = nvidia_pci_dir()
-    if not p:
-        return ""
-    # nvidia-smi 要 00000000:01:00.0 这种域宽
-    short = os.path.basename(p)  # 0000:01:00.0
-    parts = short.split(":")
-    if len(parts) == 3:
-        return f"{int(parts[0], 16):08x}:{parts[1]}:{parts[2]}"
-    return short
-
-
-def _nvidia_drain(enable: bool) -> bool:
-    bus = _nvidia_bus_id()
-    if not bus:
-        return False
-    try:
-        subprocess.run(["nvidia-smi", "-pm", "0"], capture_output=True, timeout=5)
-        r = subprocess.run(
-            ["nvidia-smi", "drain", "-p", bus, "-m", "1" if enable else "0"],
-            capture_output=True, text=True, timeout=8)
-        if r.returncode != 0:
-            # 兼容另一种 PCI 写法
-            alt = bus.split(":", 1)[-1] if bus.count(":") >= 2 else bus
-            r = subprocess.run(
-                ["nvidia-smi", "drain", "-p", alt, "-m", "1" if enable else "0"],
-                capture_output=True, text=True, timeout=8)
-        ok = r.returncode == 0
-        if not ok:
-            log(f"WARN nvidia drain {'on' if enable else 'off'}: {(r.stderr or r.stdout).strip()[:120]}")
-        return ok
-    except Exception as e:
-        log(f"WARN nvidia drain: {e}")
-        return False
+    return read_text(f"{p}/power/runtime_status") if p else None
 
 
 class HybridBatteryIgpu:
-    """混合模式下: 离电 → 集显优先(禁独显新负载); 插电 → 恢复按需独显"""
+    """混合模式下: 离电 → 强制 RTD3 并停止 GPU 轮询; 插电 → 恢复正常轮询"""
 
     def __init__(self):
         self.enabled = load_state().get("hybrid_battery_igpu", True)
@@ -771,39 +765,51 @@ class HybridBatteryIgpu:
             return load_state().get("mux_mode", "standard") == "standard"
         return False
 
-    def _enter(self):
-        """离电: 禁独显新客户端 + 尝试 IGPS(1)"""
-        drain_ok = _nvidia_drain(True)
-        igps = acpi_method(f"{MUX_PATH}.IGPS", "1")
-        os.makedirs(RUN_DIR, exist_ok=True)
-        open(BATTERY_IGPU_FLAG, "w").write("1\n")
-        # PCI 运行时自动挂起
-        p = nvidia_pci_dir()
-        if p:
+    @staticmethod
+    def _enforce_rtd3() -> int:
+        """把 10de 设备的 power/control 设为 auto, 允许运行时挂起; 返回设备数"""
+        n = 0
+        for p in _glob.glob("/sys/bus/pci/devices/*"):
             try:
+                if read_text(f"{p}/vendor") != "0x10de":
+                    continue
                 with open(f"{p}/power/control", "w") as f:
                     f.write("auto")
-                with open(f"{p}/power/autosuspend_delay_ms", "w") as f:
-                    f.write("1000")
+                try:
+                    with open(f"{p}/power/autosuspend_delay_ms", "w") as f:
+                        f.write("1000")
+                except OSError:
+                    pass
+                n += 1
             except OSError:
-                pass
+                continue
+        return n
+
+    def _enter(self):
+        """离电: 允许独显 RTD3 休眠 (drain 不会断电, 运行时 IGPS 有黑屏风险, 均已移除)"""
+        n = self._enforce_rtd3()
+        os.makedirs(RUN_DIR, exist_ok=True)
+        try:
+            open(BATTERY_IGPU_FLAG, "w").write("1\n")
+        except OSError:
+            pass
         self.active = True
-        self.last_msg = f"drain={'ok' if drain_ok else 'fail'} IGPS={igps}"
-        log(f"离电集显: 已禁用独显新负载 ({self.last_msg})")
+        self.last_msg = f"RTD3 {n} 个设备 auto" if n else "未找到 NVIDIA 设备"
+        log(f"离电独显休眠: {self.last_msg}")
 
     def _leave(self):
-        """插电: 恢复独显按需"""
+        """插电: 恢复正常遥测轮询 (power/control 保持 auto, 空闲仍可休眠)"""
         try:
             os.remove(BATTERY_IGPU_FLAG)
         except OSError:
             pass
-        igps = acpi_method(f"{MUX_PATH}.IGPS", "0")
-        drain_ok = _nvidia_drain(False)
         self.active = False
-        self.last_msg = f"drain={'ok' if drain_ok else 'fail'} IGPS={igps}"
-        log(f"插电恢复: 独显可按需使用 ({self.last_msg})")
+        self.last_msg = "插电恢复轮询"
+        log("插电: 恢复独显遥测轮询")
 
     def poll(self):
+        if sleeping.is_set():
+            return
         ac = _ac_online()
         if ac is None:
             return
@@ -1038,13 +1044,27 @@ def _smi_float(s):
 
 
 _gpu_cache = {"t": 0.0, "v": None}
-GPU_TTL = 4.0                   # nvidia-smi 冷启动约 100ms, 4s 内复用, GUI 2s 轮询时约减半调用
+GPU_TTL_ACTIVE = 4.0            # 有负载时正常刷新
+GPU_TTL_IDLE = 30.0             # 空闲: 拉长间隔, 给 RTD3 留出休眠窗口
+GPU_TTL_BATTERY = 90.0          # 离电休眠策略生效时更激进
+
+
+def _gpu_ttl():
+    v = _gpu_cache["v"] or {}
+    if v.get("suspended") or v.get("error"):
+        return 15.0
+    idle = (v.get("util_pct") or 0) < 1 and (v.get("draw_w") or 0) < 5
+    if idle:
+        if hybrid_battery_igpu and hybrid_battery_igpu.active:
+            return GPU_TTL_BATTERY
+        return GPU_TTL_IDLE
+    return GPU_TTL_ACTIVE
 
 
 def gpu_info():
-    """GPU 功耗 + 显存 + 频率 + 利用率 (结果缓存, 避免每次 status 都拉 nvidia-smi)"""
+    """GPU 功耗 + 显存 + 频率 + 利用率 (缓存 + 空闲降频, 避免把 RTD3 睡下的独显唤醒)"""
     now = time.time()
-    if _gpu_cache["v"] is not None and now - _gpu_cache["t"] < GPU_TTL:
+    if _gpu_cache["v"] is not None and now - _gpu_cache["t"] < _gpu_ttl():
         return _gpu_cache["v"]
     out = _gpu_info()
     _gpu_cache.update(t=now, v=out)
@@ -1213,6 +1233,69 @@ def platform_info(profile: str) -> dict:
     return v
 
 
+# ================================================================ 睡眠/唤醒
+def restore_after_resume():
+    """开机/唤醒后 EC 可能被固件重置: 重放档位、限充、键盘灯与 INOU 开关"""
+    st = load_state()
+    prof = st.get("profile")
+    if prof in PROFILE_BITS:
+        r = set_profile(prof, kbd=False)
+        log(f"恢复性能档位 {prof}: {r.get('ok')}")
+    limit = st.get("charge_limit")
+    if isinstance(limit, int):
+        set_charge_limit(limit)
+    kbd = st.get("kbd") or {}
+    if kbd:
+        r = kbd_set(brightness=kbd.get("brightness"), rgb=kbd.get("rgb"),
+                    effect=kbd.get("effect") or "solid")
+        log(f"恢复键盘灯: {r.get('ok')}")
+    for name, val in (st.get("toggles") or {}).items():
+        toggle_sysfs(name, bool(val))
+    if ac_led_guard:
+        ac_led_guard.poll()
+
+
+def sleep_watch_loop():
+    """订阅 logind PrepareForSleep: 睡前冻结采样/EC 轮询, 醒后重放设置"""
+    try:
+        from gi.repository import Gio, GLib
+    except Exception as e:
+        log(f"WARN 无法加载 Gio, 跳过睡眠监听: {e}")
+        return
+
+    def on_prepare(_conn, _sender, _path, _iface, _signal, params):
+        try:
+            going = bool(params.unpack()[0])
+        except Exception:
+            return
+        if going:
+            sleeping.set()
+            if sampler:
+                sampler.paused.set()
+            log("系统即将睡眠: 冻结采样与 EC 轮询")
+        else:
+            log("系统已唤醒: 恢复设置")
+            time.sleep(2)               # 等 EC/驱动就绪
+            try:
+                restore_after_resume()
+            except Exception as e:
+                log(f"WARN 唤醒恢复失败: {e}")
+            finally:
+                if sampler:
+                    sampler.paused.clear()
+                sleeping.clear()
+
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        bus.signal_subscribe("org.freedesktop.login1", "org.freedesktop.login1.Manager",
+                             "PrepareForSleep", "/org/freedesktop/login1", None,
+                             Gio.DBusSignalFlags.NONE, on_prepare)
+        log("已订阅 logind 睡眠/唤醒事件")
+        GLib.MainLoop().run()
+    except Exception as e:
+        log(f"WARN 睡眠监听失败: {e}")
+
+
 def status():
     profile = get_profile()
     tel = sampler.snapshot() if sampler else {}
@@ -1234,6 +1317,7 @@ def status():
         "platform": platform_info(profile),
         "cpu_boost": read_text(CPU_BOOST_PATH) == "1" if os.path.exists(CPU_BOOST_PATH) else None,
         "gpu": gpu_info(),
+        "gpu_runtime": gpu_runtime_status(),
         "cpu": cpu_info(),
         "fan1_rpm": hw_val("fan1_rpm", "fan1_input"),
         "fan2_rpm": hw_val("fan2_rpm", "fan2_input"),
@@ -1299,6 +1383,7 @@ class ResourceSampler(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.stop_evt = threading.Event()
+        self.paused = threading.Event()     # 睡眠期间暂停采样
         self.lock = threading.Lock()
         self._prev = {}
         self.snap = {}
@@ -1463,10 +1548,11 @@ class ResourceSampler(threading.Thread):
 
     def run(self):
         while not self.stop_evt.is_set():
-            try:
-                self._once()
-            except Exception as e:
-                log(f"WARN ResourceSampler: {e}")
+            if not self.paused.is_set():
+                try:
+                    self._once()
+                except Exception as e:
+                    log(f"WARN ResourceSampler: {e}")
             self.stop_evt.wait(self.INTERVAL)
 
 
@@ -1499,7 +1585,13 @@ def handle_cmd(cmd):
             return mux_switch(sub)
         return {"ok": False, "error": "mux 子命令: query|igpu|standard|dgpu"}
     if op == "toggle":
-        return toggle_sysfs(cmd.get("name", ""), bool(cmd.get("value")))
+        name, val = cmd.get("name", ""), bool(cmd.get("value"))
+        r = toggle_sysfs(name, val)
+        if r.get("ok"):
+            t = dict(load_state().get("toggles") or {})
+            t[name] = val
+            state_update(toggles=t)     # 睡眠/开机后按此恢复
+        return r
     if op == "calibrate":
         return start_calibration()
     if op == "ac_led_off":
@@ -1598,8 +1690,11 @@ sampler = None
 
 
 def ac_poll_loop():
-    """离电关灯 / 离电集显 轮询 (5s 周期, 拔电要尽快生效)"""
+    """离电关灯 / 离电独显休眠 轮询 (5s 周期, 拔电要尽快生效)"""
     while True:
+        if sleeping.is_set():
+            time.sleep(1)
+            continue
         try:
             ac_led_guard.poll()
         except Exception as e:
@@ -1613,13 +1708,12 @@ def ac_poll_loop():
 
 
 def restore_on_boot():
-    st = load_state()
     time.sleep(3)
-    prof = st.get("profile")
-    if prof in PROFILE_BITS:
-        r = set_profile(prof, kbd=False)
-        log(f"开机恢复性能模式 {prof}: {r.get('ok')}")
-    if st.get("fan_curve"):
+    try:
+        restore_after_resume()
+    except Exception as e:
+        log(f"WARN 开机恢复失败: {e}")
+    if load_state().get("fan_curve"):
         state_update(fan_curve=None)     # 旧版用户态曲线的残留状态
 
 
@@ -1662,6 +1756,7 @@ def main():
     threading.Thread(target=restore_on_boot, daemon=True).start()
     threading.Thread(target=ac_poll_loop, daemon=True).start()
     threading.Thread(target=profile_watch_loop, daemon=True).start()
+    threading.Thread(target=sleep_watch_loop, daemon=True).start()
     serve()
 
 
