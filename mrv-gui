@@ -789,7 +789,8 @@ class MrvApp:
 
         self.win = Gtk.Window(title="mrv-ctl")
         self.win.set_decorated(False)
-        self.win.set_resizable(False)
+        self.win.set_resizable(True)               # 允许拖动缩放, 尺寸/位置写入 gui.json
+        self.win.set_size_request(360, 420)        # 最小尺寸 (内容不被压坏)
         self.win.set_icon_name("mrv-ctl")
         rgba = enable_rgba(self.win)
         margin = SHADOW_MARGIN if rgba else 0
@@ -797,7 +798,7 @@ class MrvApp:
         self.win.connect("destroy", self.on_quit)
 
         shell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        shell.set_size_request(380, -1)
+        shell.set_size_request(-1, -1)
         add_class(shell, "shell", *(() if rgba else ("opaque",)))
         for side in ("top", "bottom", "start", "end"):
             getattr(shell, f"set_margin_{side}")(margin)
@@ -818,8 +819,10 @@ class MrvApp:
         self.bubble = Bubble(self)
         self.tray = self._build_tray()
 
-        if "pos" in self.cfg:
-            self.win.move(*self.cfg["pos"])
+        width, height = self._initial_size()
+        self.win.set_default_size(width, height)
+        if "pos" in self.cfg and len(self.cfg["pos"]) == 2:
+            self.win.move(*self._clamp_pos(self.cfg["pos"][0], self.cfg["pos"][1], width, height))
         else:
             self.win.set_position(Gtk.WindowPosition.CENTER)
         self.set_view(self.cfg.get("view", "overview"))
@@ -829,11 +832,46 @@ class MrvApp:
         self.refresh()
         threading.Thread(target=self._query_mux, daemon=True).start()
 
-    # ---------------------------------------------------- 构建
+    # ---------------------------------------------------- 构建 / 尺寸
+    @staticmethod
+    def _workarea():
+        """当前主显示器工作区 (逻辑像素, GTK 已处理缩放系数)"""
+        disp = Gdk.Display.get_default()
+        mon = disp.get_primary_monitor() if disp else None
+        if mon is None:
+            return Gdk.Rectangle(x=0, y=0, width=1920, height=1080)
+        return mon.get_workarea()
+
+    def _initial_size(self):
+        """默认 420 宽; 高度按工作区自适应; 用户拉过则记住尺寸"""
+        wa = self._workarea()
+        size = self.cfg.get("size") or []
+        if len(size) == 2:
+            w, h = int(size[0]), int(size[1])
+        else:
+            w, h = 420, min(920, int(wa.height * 0.86))
+        w = max(360, min(w, max(360, min(760, wa.width - 40))))
+        h = max(420, min(h, max(420, wa.height - 40)))
+        return w, h
+
+    def _clamp_pos(self, x, y, w, h):
+        """把窗口位置夹到可见工作区内 (换屏/改缩放后不会跑到屏幕外)"""
+        wa = self._workarea()
+        x = max(wa.x, min(int(x), wa.x + wa.width - min(int(w), wa.width)))
+        y = max(wa.y, min(int(y), wa.y + wa.height - min(int(h), wa.height)))
+        return x, y
+
+    def _save_geometry(self):
+        w, h = self.win.get_size()
+        if w > 1 and h > 1:
+            self.cfg["size"] = [w, h]
+            self.cfg["pos"] = list(self._clamp_pos(*self.win.get_position(), w, h))
+
     def _scroll(self, child):
-        # 窗口高度跟随内容 (取两页中较高者), 超过上限才滚动, 滚动条隐藏
-        sw = Gtk.ScrolledWindow(propagate_natural_height=True, max_content_height=760)
-        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.EXTERNAL)
+        # 固定窗口尺寸 + 页内滚动 (窗口可自由缩放, 内容不再撑大窗口)
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.set_overlay_scrolling(True)
         sw.add(child)
         sw.show_all()           # Gtk.Stack 只能切换到已显示的子页
         return sw
@@ -1014,7 +1052,7 @@ class MrvApp:
         sec = Section("preferences-system-symbolic", "开关", last=True)
         self.switches = {}
         rows = TOGGLE_ROWS + (
-            ("hybrid_battery_igpu", "离电用集显", "混合模式下拔电禁用独显新负载, 插电恢复"),
+            ("hybrid_battery_igpu", "离电独显休眠", "混合模式拔电后允许独显 RTD3 待机并停止轮询"),
             ("ac_led_off", "离电关灯", "拔掉电源时自动关闭键盘灯"),
         )
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -1414,8 +1452,9 @@ class MrvApp:
         save_config(self.cfg)
 
     def show_main(self):
-        if "pos" in self.cfg:
-            self.win.move(*self.cfg["pos"])
+        if "pos" in self.cfg and len(self.cfg["pos"]) == 2:
+            w, h = self.win.get_size()
+            self.win.move(*self._clamp_pos(self.cfg["pos"][0], self.cfg["pos"][1], w, h))
         self.win.show_all()
         self.win.present()
         self.refresh()                  # 从托盘恢复时立即拉一次, 不等 8s 慢轮询
@@ -1427,7 +1466,7 @@ class MrvApp:
             self.show_main()
 
     def on_delete(self, w, e):
-        self.cfg["pos"] = list(self.win.get_position())
+        self._save_geometry()
         save_config(self.cfg)
         if not self.tray:
             self.on_quit()
@@ -1437,7 +1476,7 @@ class MrvApp:
 
     def on_quit(self, *a):
         if self.win.get_visible():
-            self.cfg["pos"] = list(self.win.get_position())
+            self._save_geometry()
         if self.bubble.get_visible():
             self.cfg["bubble_pos"] = list(self.bubble.get_position())
         save_config(self.cfg)
@@ -1499,7 +1538,10 @@ class MrvApp:
         if power:
             meta += f" · {power}"
         if r.get("battery_igpu_active") or (self.st or {}).get("battery_igpu_active"):
-            meta += " · 离电集显中"
+            meta += " · 离电独显待机"
+        rt = (self.st or {}).get("gpu_runtime")
+        if rt == "suspended":
+            meta += " · 独显 D3hot"
         if r.get("warning"):
             meta += " · EFI 读失败已用缓存"
         self.sec_mux.meta.set_text(meta)
@@ -1557,6 +1599,7 @@ class MrvApp:
         g = st.get("gpu", {})
         prof = PROFILE_NAMES.get(st.get("profile"), st.get("profile") or "")
 
+        drv = f.get("gpu_driver")
         draw = g.get("draw_w")
         self.total_tween.set(draw if draw is not None else (0.0 if g.get("suspended") else None))
         if g.get("suspended"):
@@ -1564,6 +1607,8 @@ class MrvApp:
         elif draw is not None:
             cur_l, max_l = g.get("current_limit_w"), g.get("max_limit_w")
             self.cost.set_text(f"上限 {cur_l or 0:.0f} W · 最大 {max_l or 0:.0f} W · {prof}档")
+        elif drv is False:
+            self.cost.set_text("NVIDIA 驱动未加载 · 请安装匹配当前内核的模块")
         else:
             self.cost.set_text(g.get("error") or "nvidia-smi 不可用")
 
@@ -1591,9 +1636,12 @@ class MrvApp:
 
         # GPU
         gt = st.get("gpu_temp")
-        self.sec_gpu.plan.set_text(f.get("gpu_name", ""))
+        self.sec_gpu.plan.set_text("驱动未加载" if drv is False else f.get("gpu_name", ""))
         if g.get("suspended"):
-            self.sec_gpu.meta.set_text("独显休眠中, 不读取以免唤醒")
+            self.sec_gpu.meta.set_text("独显已休眠 (RTD3), 不读取以免唤醒")
+            self.gpu_grid.hide()
+        elif drv is False:
+            self.sec_gpu.meta.set_text("NVIDIA 驱动未加载 · 独显无法管理")
             self.gpu_grid.hide()
         else:
             self.gpu_grid.show()
@@ -1695,7 +1743,8 @@ class MrvApp:
             if not r.get("ok"):
                 GLib.idle_add(self._flash_error, r.get("error") or r.get("raw") or "操作失败")
             if then_refresh:
-                GLib.idle_add(self.refresh)
+                # refresh() 返回 True (给旧定时器用); 作为 idle 回调会永久重复 -> 点一次按钮就 100% CPU
+                GLib.idle_add(lambda: (self.refresh(), False)[1])
         threading.Thread(target=run, daemon=True).start()
 
     def _flash_error(self, msg):
