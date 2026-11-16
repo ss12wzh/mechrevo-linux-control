@@ -53,7 +53,7 @@ DEBUG = os.environ.get("MRV_GUI_DEBUG") == "1"
 def dbg(msg):
     if DEBUG:
         print(f"[gui {time.strftime('%T')}] {msg}", file=sys.stderr, flush=True)
-VERSION = "3.6.0"
+VERSION = "3.6.1"
 CONFIG_PATH = os.path.join(GLib.get_user_config_dir(), "mrv-ctl", "gui.json")
 SHADOW_MARGIN = 14              # 透明窗口外沿, 用来画面板阴影
 HISTORY_SPAN_S = 600            # 监控曲线窗口: 最近 10 分钟
@@ -262,6 +262,29 @@ button.icon-button.active { color: @mrv_accent; border-color: rgba(183, 234, 212
   background-color: rgba(4, 8, 13, 0.45); color: @mrv_text; font-size: 10px;
 }
 .update-notes { border-radius: 6px; }
+
+/* ---------- 滚动条 (细轨 + 薄荷滑块, 去掉上下箭头) */
+.shell scrollbar { background-color: transparent; border: none; box-shadow: none; }
+.shell scrollbar trough {
+  background-color: rgba(4, 8, 13, 0.32); border-radius: 3px; margin: 2px;
+}
+.shell scrollbar slider {
+  background-color: rgba(183, 234, 212, 0.42); border-radius: 3px;
+  border: none; min-width: 5px; min-height: 30px;
+}
+.shell scrollbar slider:hover { background-color: rgba(183, 234, 212, 0.66); }
+.shell scrollbar button {
+  -gtk-icon-source: none; min-width: 0; min-height: 0; padding: 0; border: none;
+}
+
+/* ---------- 对话框 (默认主题是白底, 会露出白框) */
+window.mrv-dialog, window.mrv-dialog.background {
+  background-color: #282c32; color: @mrv_text; border: none;
+}
+window.mrv-dialog decoration { border: none; box-shadow: none; background-color: transparent; }
+window.mrv-dialog .shell {
+  border-radius: 10px; border-color: transparent; box-shadow: none;
+}
 
 /* ---------- 弹出菜单 */
 popover.mrv-menu {
@@ -899,6 +922,8 @@ class MrvApp:
         sw = Gtk.ScrolledWindow()
         sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         sw.set_overlay_scrolling(True)
+        # 悬浮滚动条会盖住右侧文字 (EC 自动/重启生效等), 给内容留出滚动条宽度
+        child.set_margin_end(10)
         sw.add(child)
         sw.show_all()           # Gtk.Stack 只能切换到已显示的子页
         return sw
@@ -1663,10 +1688,17 @@ class MrvApp:
         plat = st.get("platform") or {}
         cap = plat.get("cpu_ppt_w")
         boost = st.get("cpu_boost")
+        gov, epp = st.get("cpu_governor"), st.get("cpu_epp")
+        power_hint = ""
+        if gov == "performance":
+            power_hint = "调度 performance（空载高功耗）"
+        elif epp == "performance":
+            power_hint = "EPP performance（高功耗）"
         self.sec_cpu.meta.set_text(" · ".join(x for x in (
             f"{ct:.0f}°C" if ct is not None else "",
             f"功耗墙 ≈{cap} W" if cap else "",
-            "睿频已关" if boost is False else f"最高 {max_mhz} MHz") if x))
+            "睿频已关" if boost is False else f"最高 {max_mhz} MHz",
+            power_hint) if x))
         self.m_cpu["temp"].update(f"{ct:.0f}°C" if ct is not None else "—", (ct or 0) / 100, self._temp_level(ct))
         self.m_cpu["power"].update(f"{pw:.1f} W" if pw is not None else "—", (pw or 0) / (cap or 120),
                                    "warn" if cap and pw and pw >= cap * 0.95 else None,
@@ -1862,7 +1894,8 @@ class MrvApp:
         """暗色风格对话框 (复用面板视觉)"""
         dlg = Gtk.Dialog(title=title, transient_for=self.win, modal=True)
         dlg.set_decorated(False)
-        dlg.set_default_size(420, -1)
+        dlg.set_default_size(440, -1)
+        add_class(dlg, "mrv-dialog")
         box = dlg.get_content_area()
         add_class(box, "shell")
         box.set_spacing(10)

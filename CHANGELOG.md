@@ -1,5 +1,12 @@
 # 变更记录
 
+## 3.6.1 — 2026-11-16 · 电源策略 / 界面修复
+
+- CPU 电源策略纳入档位管理：统一 `powersave` governor；平衡档 EPP 改 `balance_power`、狂暴档改 `balance_performance`，不再使用 `performance`（本机实测空载 69W → 约 40W）
+- 物理键轮询顺带纠正外部工具（power-profiles-daemon / TCC）改成的 `performance` governor/EPP，并在 CPU 分区提示高功耗状态
+- 修复悬浮滚动条遮挡右侧文字（「EC 自动 / 重启生效 / 90%」被截断），并改为细轨薄荷滑块、去掉上下箭头
+- 修复「检查更新」对话框露出白色外框，改为暗色面板风格
+
 ## 3.6.0 — 2026-11-16 · 稳定性 / RTD3 / 自动更新
 
 - 修复点击任意控制项后 GUI 单核 100% CPU 的死循环（idle 回调返回 `True` 导致永久重复执行）

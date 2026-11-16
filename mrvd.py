@@ -227,10 +227,11 @@ def get_profile():
 
 # 档位联动: 功耗墙由 EC 固件随档位位切换; 这里附带 CPU EPP / 睿频与灯效.
 # EPP 不影响满载功耗 (A/B 实测); 静音档关睿频让轻负载下空闲功耗 46 -> 39.5 W (后台 ToDesk 编码时实测)
+# EPP 只做偏向, 不用 performance: 本机实测 performance 空载约 69W, balance_performance 约 40W
 PROFILE_ACTIONS = {
     "office": {"epp": "power", "cpu_boost": False, "kbd_brightness": 30, "kbd_rainbow": False},
-    "balanced": {"epp": "balance_performance", "cpu_boost": True, "kbd_brightness": 80, "kbd_rainbow": False},
-    "boost": {"epp": "performance", "cpu_boost": True, "kbd_brightness": 150, "kbd_rainbow": True},
+    "balanced": {"epp": "balance_power", "cpu_boost": True, "kbd_brightness": 80, "kbd_rainbow": False},
+    "boost": {"epp": "balance_performance", "cpu_boost": True, "kbd_brightness": 150, "kbd_rainbow": True},
 }
 CPU_BOOST_PATH = "/sys/devices/system/cpu/cpufreq/boost"
 
@@ -262,6 +263,40 @@ def apply_epp(value: str) -> bool:
     return ok
 
 
+def apply_governor(value: str = "powersave") -> bool:
+    """统一调频策略; amd-pstate-epp 下官方推荐 powersave, 由 EPP 决定频率偏向"""
+    base = "/sys/devices/system/cpu"
+    ok = False
+    for d in os.listdir(base):
+        if not d.startswith("cpu") or not d[3:].isdigit():
+            continue
+        p = f"{base}/{d}/cpufreq/scaling_governor"
+        if os.path.exists(p):
+            try:
+                with open(p, "w") as f:
+                    f.write(value)
+                ok = True
+            except OSError:
+                pass
+    return ok
+
+
+def enforce_cpu_policy():
+    """外部工具 (power-profiles-daemon / TCC) 可能把 governor/EPP 改成高功耗档;
+    按当前性能档纠正, 避免空载 50W+"""
+    act = PROFILE_ACTIONS.get(get_profile())
+    if not act:
+        return
+    gov = read_text("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+    if gov and gov != "powersave" and apply_governor("powersave"):
+        log(f"纠正 CPU 调度策略 {gov} -> powersave")
+    want = act.get("epp")
+    cur = read_text("/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference")
+    if want and cur and cur != want:
+        apply_epp(want)
+        log(f"纠正 CPU EPP {cur} -> {want}")
+
+
 def apply_profile_actions(name: str, kbd=True):
     """应用档位联动 (CPU/灯效); kbd=False 时不动键盘灯, 保留用户手动调过的亮度"""
     act = PROFILE_ACTIONS.get(name)
@@ -269,6 +304,7 @@ def apply_profile_actions(name: str, kbd=True):
         return
     if act.get("epp"):
         apply_epp(act["epp"])
+    apply_governor("powersave")
     if "cpu_boost" in act:
         apply_cpu_boost(act["cpu_boost"])
     if kbd:
@@ -320,6 +356,7 @@ def profile_watch_loop():
                         state_update(profile=cur)
                         apply_profile_actions(cur)
                     _profile_seen = cur
+            enforce_cpu_policy()
         except Exception as e:
             log(f"WARN profile watch: {e}")
         time.sleep(3)
@@ -1424,6 +1461,9 @@ def status():
         "gpu": gpu_info(),
         "gpu_runtime": gpu_runtime_status(),
         "cpu": cpu_info(),
+        "cpu_governor": read_text("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
+        "cpu_epp": read_text(
+            "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference"),
         "fan1_rpm": hw_val("fan1_rpm", "fan1_input"),
         "fan2_rpm": hw_val("fan2_rpm", "fan2_input"),
         "pwm1": hw_val("pwm1", "pwm1"),
